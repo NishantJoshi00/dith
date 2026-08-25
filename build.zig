@@ -11,12 +11,21 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // Camera module (depends on types)
+    // C bindings for the camera wrapper. Zig 0.16 deprecates @cImport in
+    // favor of translate-c driven from the build graph.
+    const camera_c = b.addTranslateC(.{
+        .root_source_file = b.path("deps/camera_wrapper.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Camera module (depends on types + C bindings)
     const camera_mod = b.addModule("camera", .{
         .root_source_file = b.path("src/camera.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "types", .module = types_mod },
+            .{ .name = "c", .module = camera_c.createModule() },
         },
     });
     camera_mod.addIncludePath(b.path("deps"));
@@ -97,10 +106,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Terminal module (depends on types)
+    // Terminal module (depends on types; calls libc ioctl for the window size)
     const term_mod = b.addModule("term", .{
         .root_source_file = b.path("src/term.zig"),
         .target = target,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "types", .module = types_mod },
         },
@@ -115,12 +125,21 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // C bindings for stb_image (declarations only; the implementation is
+    // compiled separately from stb_image_impl.c)
+    const stb_image_c = b.addTranslateC(.{
+        .root_source_file = b.path("deps/stb_image.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Image module (depends on types, uses stb_image)
     const image_mod = b.addModule("image", .{
         .root_source_file = b.path("src/image.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "types", .module = types_mod },
+            .{ .name = "c", .module = stb_image_c.createModule() },
         },
     });
     image_mod.addIncludePath(b.path("deps"));

@@ -11,21 +11,17 @@ pub const TermSize = struct {
 /// Get current terminal size
 pub fn getTermSize() !TermSize {
     // Use TIOCGWINSZ ioctl to get terminal size on Unix systems
-    const c = @cImport({
-        @cInclude("sys/ioctl.h");
-        @cInclude("unistd.h");
-    });
-
-    var winsize: c.winsize = undefined;
-    const result = c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &winsize);
+    var winsize: std.posix.winsize = undefined;
+    const request: c_int = @intCast(std.c.T.IOCGWINSZ);
+    const result = std.c.ioctl(std.posix.STDOUT_FILENO, request, &winsize);
 
     if (result == -1) {
         return error.TermSizeUnavailable;
     }
 
     return TermSize{
-        .cols = winsize.ws_col,
-        .rows = winsize.ws_row,
+        .cols = winsize.col,
+        .rows = winsize.row,
     };
 }
 
@@ -78,12 +74,9 @@ pub fn clearScreen(stdout: anytype) !void {
 }
 
 /// Move cursor to top-left
-pub fn moveCursorHome() !void {
-    var buffer: [32]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&buffer);
-    const stdout = &writer.interface;
+/// Accepts any writer type (typically a buffered stdout writer)
+pub fn moveCursorHome(stdout: anytype) !void {
     try stdout.writeAll("\x1B[H");
-    try stdout.flush();
 }
 
 test "terminal size" {

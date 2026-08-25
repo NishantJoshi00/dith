@@ -44,7 +44,7 @@ dith +source=file +mode=bayer +path=image.jpg +invert
 
 ## Install
 
-**Requirements:** Zig 0.15.1+, macOS (for camera source)
+**Requirements:** Zig 0.16.0+, macOS (for camera source)
 
 ```bash
 git clone https://github.com/user/dith

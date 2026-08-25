@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types");
+const Io = std.Io;
 
 // =============================================================================
 // Source configurations (tagged union)
@@ -139,8 +140,10 @@ fn getActivePayload(comptime U: type, u: *U) ?struct { name: []const u8, ptr: *a
 // Main parsing
 // =============================================================================
 
-pub fn parse() CliError!?Args {
-    var iter = std.process.args();
+/// Parse process arguments. Returns null when help was requested; the caller
+/// is responsible for printing it (see `printHelp`).
+pub fn parse(io: Io, process_args: std.process.Args) CliError!?Args {
+    var iter = process_args.iterate();
     const args = try parseFromIter(&iter);
 
     if (args) |a| {
@@ -150,7 +153,7 @@ pub fn parse() CliError!?Args {
                 if (f.path.len == 0) {
                     return ValidationError.MissingFilePath;
                 }
-                try validateFile(f.path);
+                try validateFile(io, f.path);
             },
             else => {},
         }
@@ -159,6 +162,8 @@ pub fn parse() CliError!?Args {
     return args;
 }
 
+/// Parse from any iterator whose `next()` yields `?[]const u8`-compatible
+/// slices. Returns null when `+help` is encountered.
 pub fn parseFromIter(iter: anytype) ParseError!?Args {
     // Skip program name
     _ = iter.next();
@@ -166,7 +171,6 @@ pub fn parseFromIter(iter: anytype) ParseError!?Args {
     // First arg: must be +source=X or +help
     const first = iter.next() orelse return ParseError.MissingSource;
     if (std.mem.eql(u8, first, "+help")) {
-        printHelp();
         return null;
     }
     if (!std.mem.startsWith(u8, first, "+source=")) {
@@ -184,7 +188,6 @@ pub fn parseFromIter(iter: anytype) ParseError!?Args {
     // Remaining args: distribute to source or mode based on field name
     while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "+help")) {
-            printHelp();
             return null;
         }
 
@@ -265,14 +268,14 @@ fn detectFormat(header: []const u8) ImageFormat {
     return .unknown;
 }
 
-fn validateFile(path: []const u8) ValidationError!void {
-    const file = std.fs.cwd().openFile(path, .{}) catch {
+fn validateFile(io: Io, path: []const u8) ValidationError!void {
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch {
         return ValidationError.FileNotFound;
     };
-    defer file.close();
+    defer file.close(io);
 
     var header: [8]u8 = undefined;
-    const bytes_read = file.read(&header) catch {
+    const bytes_read = file.readStreaming(io, &.{&header}) catch {
         return ValidationError.FileReadError;
     };
 
@@ -285,7 +288,7 @@ fn validateFile(path: []const u8) ValidationError!void {
 // Help
 // =============================================================================
 
-pub fn printHelp() void {
+pub fn printHelp(io: Io) void {
     const help_text =
         \\dith - Terminal dithering tool
         \\
@@ -328,15 +331,15 @@ pub fn printHelp() void {
         \\
     ;
     var buffer: [4096]u8 = undefined;
-    var writer = std.fs.File.stderr().writer(&buffer);
+    var writer = Io.File.stderr().writerStreaming(io, &buffer);
     const stderr = &writer.interface;
     stderr.writeAll(help_text) catch {};
     stderr.flush() catch {};
 }
 
-pub fn printErrorAndHelp(err: CliError) void {
+pub fn printErrorAndHelp(io: Io, err: CliError) void {
     var buffer: [1024]u8 = undefined;
-    var writer = std.fs.File.stderr().writer(&buffer);
+    var writer = Io.File.stderr().writerStreaming(io, &buffer);
     const stderr = &writer.interface;
     const msg: []const u8 = switch (err) {
         ParseError.MissingSource => "error: +source is required\n\n",
@@ -353,7 +356,7 @@ pub fn printErrorAndHelp(err: CliError) void {
     };
     stderr.writeAll(msg) catch {};
     stderr.flush() catch {};
-    printHelp();
+    printHelp(io);
 }
 
 // =============================================================================

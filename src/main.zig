@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const dith = @import("dith");
 const camera = dith.camera;
 const converter = dith.converter;
@@ -67,17 +68,18 @@ const DirectCapture = struct {
     }
 };
 
-/// Double-buffered frame pipeline that captures frames in background thread
+/// Double-buffered frame pipeline that captures frames on a background task
 /// while the main thread processes previously captured frames.
 const PipelinedCapture = struct {
     camera: *camera.Camera,
     allocator: std.mem.Allocator,
+    io: Io,
 
     buffers: [2]OwnedImage,
     write_idx: usize,
 
-    mutex: std.Thread.Mutex,
-    capture_thread: std.Thread,
+    mutex: Io.Mutex,
+    capture_task: Io.Future(void),
     should_stop: std.atomic.Value(bool),
 
     const OwnedImage = struct {
@@ -98,8 +100,8 @@ const PipelinedCapture = struct {
 
     const Self = @This();
 
-    /// Initialize pipeline and start background capture thread
-    pub fn init(allocator: std.mem.Allocator, cam: *camera.Camera) !*Self {
+    /// Initialize pipeline and start the background capture task
+    pub fn init(allocator: std.mem.Allocator, io: Io, cam: *camera.Camera) !*Self {
         const pipeline = try allocator.create(Self);
         errdefer allocator.destroy(pipeline);
 
@@ -119,6 +121,7 @@ const PipelinedCapture = struct {
         pipeline.* = .{
             .camera = cam,
             .allocator = allocator,
+            .io = io,
             .buffers = .{
                 .{
                     .data = buf0,
@@ -134,13 +137,14 @@ const PipelinedCapture = struct {
                 },
             },
             .write_idx = 0,
-            .mutex = .{},
-            .should_stop = std.atomic.Value(bool).init(false),
-            .capture_thread = undefined,
+            .mutex = .init,
+            .should_stop = .init(false),
+            .capture_task = undefined,
         };
 
-        // Start background capture thread
-        pipeline.capture_thread = try std.Thread.spawn(.{}, captureLoop, .{pipeline});
+        // Start background capture task. `concurrent` (not `async`) because the
+        // loop must actually run in parallel with the render loop.
+        pipeline.capture_task = try io.concurrent(captureLoop, .{pipeline});
 
         return pipeline;
     }
@@ -158,8 +162,8 @@ const PipelinedCapture = struct {
 
     fn getNextFrameImpl(ptr: *anyopaque) camera.Image {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Read from the buffer that's NOT being written to
         const read_idx = 1 - self.write_idx;
@@ -169,21 +173,21 @@ const PipelinedCapture = struct {
     fn deinitImpl(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.should_stop.store(true, .release);
-        self.capture_thread.join();
+        self.capture_task.await(self.io);
 
         self.allocator.free(self.buffers[0].data);
         self.allocator.free(self.buffers[1].data);
         self.allocator.destroy(self);
     }
 
-    /// Background thread that continuously captures frames
+    /// Background task that continuously captures frames
     fn captureLoop(self: *Self) void {
         while (!self.should_stop.load(.acquire)) {
             // Capture frame (may fail, just continue to next iteration)
             const frame = self.camera.captureFrame() catch continue;
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             const idx = self.write_idx;
             const buf = &self.buffers[idx];
@@ -203,7 +207,7 @@ const PipelinedCapture = struct {
 /// Frame capture strategy selection
 const CaptureStrategy = enum {
     direct, // Simple blocking capture (no pipelining)
-    pipelined, // Double-buffered background thread
+    pipelined, // Double-buffered background task
 };
 
 /// Initialize converter based on CLI mode selection
@@ -232,19 +236,29 @@ fn initConverter(mode: cli.Mode, allocator: std.mem.Allocator) !converter.Conver
     };
 }
 
-pub fn main() !void {
+/// Monotonic clock reading in nanoseconds
+inline fn nowNs(io: Io) i96 {
+    return Io.Timestamp.now(io, .awake).toNanoseconds();
+}
+
+inline fn nsToMs(ns: i96) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    // Leak-checked debug allocator in Debug builds, libc malloc in release.
+    const allocator = init.gpa;
+
     // Parse CLI arguments
-    const args = cli.parse() catch |err| {
-        cli.printErrorAndHelp(err);
+    const args = cli.parse(io, init.minimal.args) catch |err| {
+        cli.printErrorAndHelp(io, err);
         std.process.exit(1);
     } orelse {
         // Help was requested
-        std.process.exit(0);
+        cli.printHelp(io);
+        return;
     };
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
 
     // Get terminal size
     const term_size = try term.getTermSize();
@@ -254,7 +268,7 @@ pub fn main() !void {
         .file => |file_config| {
             var img = image.load(allocator, file_config.path) catch |err| {
                 var buffer: [256]u8 = undefined;
-                var writer = std.fs.File.stderr().writer(&buffer);
+                var writer = Io.File.stderr().writerStreaming(io, &buffer);
                 const stderr = &writer.interface;
                 const msg = switch (err) {
                     image.ImageError.LoadFailed => "error: failed to load image\n",
@@ -276,7 +290,7 @@ pub fn main() !void {
             defer allocator.free(braille_text);
 
             var stdout_buffer: [32768]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+            var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
             const stdout = &stdout_writer.interface;
 
             try term.clearScreen(stdout);
@@ -317,7 +331,7 @@ pub fn main() !void {
             break :blk direct.frameSource();
         },
         .pipelined => blk: {
-            var pipeline = try PipelinedCapture.init(allocator, &cam);
+            var pipeline = try PipelinedCapture.init(allocator, io, &cam);
             break :blk pipeline.frameSource();
         },
     };
@@ -326,28 +340,36 @@ pub fn main() !void {
     // Setup buffered stdout writer (reused across frames)
     // Use larger buffer to accommodate full-screen Braille output (160x45 = ~22KB)
     var stdout_buffer: [32768]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
+    // Per-frame scratch memory. Every frame's working buffers (binary image,
+    // error rows, output text) come from here and are reclaimed with a single
+    // reset, so steady state does zero malloc/free calls per frame.
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+
     // Target 60 FPS: 1/60 second = 16.666ms = 16,666,666 nanoseconds
-    const target_frame_time_ns: i128 = 16_666_666;
+    const target_frame_time_ns: i96 = 16_666_666;
 
     // Continuous frame loop
     while (true) {
         // Start timing
-        const start_time = std.time.nanoTimestamp();
+        const start_time = nowNs(io);
 
-        // Get next frame (captured in background thread)
+        _ = frame_arena.reset(.retain_capacity);
+        const frame_allocator = frame_arena.allocator();
+
+        // Get next frame (captured on the background task)
         const frame = source.getNextFrame();
 
         // Calculate output dimensions that fit within terminal bounds
         const dims = term.calculateBrailleDimensions(frame, term_size);
 
         // Convert to Braille (with optional timing for debug builds)
-        const convert_start = if (builtin.mode == .Debug) std.time.nanoTimestamp() else 0;
-        const braille_text = try conv.convert(frame, dims.cols, dims.rows, allocator);
-        const convert_end = if (builtin.mode == .Debug) std.time.nanoTimestamp() else 0;
-        defer allocator.free(braille_text);
+        const convert_start = if (builtin.mode == .Debug) nowNs(io) else 0;
+        const braille_text = try conv.convert(frame, dims.cols, dims.rows, frame_allocator);
+        const convert_end = if (builtin.mode == .Debug) nowNs(io) else 0;
 
         // Clear screen right before rendering
         try term.clearScreen(stdout);
@@ -356,13 +378,13 @@ pub fn main() !void {
         try stdout.writeAll(braille_text);
 
         // Capture time after rendering (before debug output)
-        const render_end = if (builtin.mode == .Debug) std.time.nanoTimestamp() else 0;
+        const render_end = if (builtin.mode == .Debug) nowNs(io) else 0;
 
         // Print debug timing info (only in debug builds)
         if (builtin.mode == .Debug) {
-            const convert_ms = @as(f64, @floatFromInt(convert_end - convert_start)) / 1_000_000.0;
-            const render_ms = @as(f64, @floatFromInt(render_end - convert_end)) / 1_000_000.0;
-            const total_ms = @as(f64, @floatFromInt(render_end - start_time)) / 1_000_000.0;
+            const convert_ms = nsToMs(convert_end - convert_start);
+            const render_ms = nsToMs(render_end - convert_end);
+            const total_ms = nsToMs(render_end - start_time);
             const fps = 1000.0 / total_ms;
             try stdout.print("\nFPS: {d:.1} | Convert: {d:.1}ms | Render: {d:.1}ms | Total: {d:.1}ms\n", .{ fps, convert_ms, render_ms, total_ms });
         }
@@ -370,10 +392,10 @@ pub fn main() !void {
         try stdout.flush();
 
         // FPS capping: sleep for remaining time to achieve 60 FPS
-        const frame_time = std.time.nanoTimestamp() - start_time;
+        const frame_time = nowNs(io) - start_time;
         if (frame_time < target_frame_time_ns) {
-            const sleep_time_ns = target_frame_time_ns - frame_time;
-            std.Thread.sleep(@intCast(sleep_time_ns));
+            const remaining: Io.Duration = .fromNanoseconds(target_frame_time_ns - frame_time);
+            io.sleep(remaining, .awake) catch {};
         }
     }
 }
