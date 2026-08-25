@@ -50,6 +50,7 @@ pub const BlueNoiseConverter = struct {
     allocator: std.mem.Allocator,
     threshold: u8, // Global threshold adjustment (shifts the threshold map)
     invert: bool,
+    shading: common.Shading = .none,
 
     const Self = @This();
 
@@ -121,7 +122,7 @@ pub const BlueNoiseConverter = struct {
             }
         }
 
-        return binaryToBraille(binary, width, height, target_cols, target_rows, self.invert, allocator);
+        return binaryToBraille(binary, image, target_cols, target_rows, self.invert, self.shading, allocator);
     }
 };
 

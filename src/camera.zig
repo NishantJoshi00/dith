@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types");
+const depth = @import("depth");
 
 // Re-export Image from types for backwards compatibility
 pub const Image = types.Image;
@@ -56,12 +57,40 @@ pub const Camera = struct {
         const result = c.camera_capture_frame(self.handle, &c_image);
         try cameraErrorFromC(result);
 
+        const chroma: ?types.Chroma = if (c_image.chroma_data != null and c_image.chroma_height > 0)
+            .{
+                .data = c_image.chroma_data[0..(c_image.chroma_bytes_per_row * c_image.chroma_height)],
+                .width = c_image.chroma_width,
+                .height = c_image.chroma_height,
+                .bytes_per_row = c_image.chroma_bytes_per_row,
+            }
+        else
+            null;
+
+        const mask: ?types.Mask = if (c_image.mask_data != null and c_image.mask_height > 0)
+            .{
+                .data = c_image.mask_data[0..(c_image.mask_bytes_per_row * c_image.mask_height)],
+                .width = c_image.mask_width,
+                .height = c_image.mask_height,
+                .bytes_per_row = c_image.mask_bytes_per_row,
+            }
+        else
+            null;
+
         return Image{
             .data = c_image.data[0..(c_image.bytes_per_row * c_image.height)],
             .width = c_image.width,
             .height = c_image.height,
             .bytes_per_row = c_image.bytes_per_row,
+            .chroma = chroma,
+            .mask = mask,
         };
+    }
+
+    /// Attach a depth model (or none); frames then carry a nearness mask.
+    /// The model must outlive the camera's use of it.
+    pub fn setDepthModel(self: *Camera, model: ?*depth.Model) void {
+        c.camera_set_depth_model(self.handle, if (model) |m| m.handle else null);
     }
 
     /// Check if the camera is currently open

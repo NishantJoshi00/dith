@@ -10,6 +10,7 @@
 // Re-export the common interface
 pub const Converter = @import("converters/common").Converter;
 pub const Image = @import("converters/common").Image;
+pub const Shading = @import("converters/common").Shading;
 
 // Re-export converters
 pub const EdgeConverter = @import("converters/edge").EdgeConverter;

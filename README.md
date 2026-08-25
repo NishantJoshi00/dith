@@ -42,6 +42,26 @@ dith +source=cam +mode=edge +threshold=50
 dith +source=file +mode=bayer +path=image.jpg +invert
 ```
 
+**Add brightness, color and depth:**
+
+```bash
+# Shade dots by brightness (0.55 lifts the dither's washed-out midtones)
+dith +source=cam +mode=floyd_steinberg +gamma=0.55
+
+# Color dots from the camera, with brightness shading
+dith +source=cam +mode=atkinson +gamma=0.55 +color
+
+# Depth: keep only what's near the camera, leave the rest empty
+dith +source=cam +mode=atkinson +depth=100
+
+# Truecolor instead of the default 256-color palette
+dith +source=file +mode=blue_noise +path=photo.png +color +palette=truecolor
+```
+
+Shading ranges run from your terminal's background to its foreground — `dith` asks the terminal for them (`dith +theme` shows the answer) and `+fg`/`+bg` override it. All channels are off unless asked for, so plain output stays as fast as before.
+
+`+depth` runs [Depth Anything V2 (small)](https://huggingface.co/apple/coreml-depth-anything-v2-small) on the Neural Engine. The first use downloads the model (48 MB) into `~/.cache/dith` and compiles it there once; pass `+model=` to use your own.
+
 ## Install
 
 **Requirements:** Zig 0.16.0+, macOS (for camera source)
@@ -81,7 +101,14 @@ dith +source=file +mode=bayer +path=~/Downloads/image.jpg +invert
 |--------|-------------|---------|
 | `+threshold=N` | Sensitivity 0-255 | varies by mode |
 | `+invert` | Flip black/white | off |
+| `+gamma=G` | Shade dots by brightness with curve exponent G (lower = brighter shadows) | off |
+| `+color` | Color dots from the source's chroma | off |
+| `+depth=N` | How far into the scene to keep; 0 = only the nearest thing, 255 = everything | off |
+| `+model=PATH` | Depth model (`.mlpackage` or `.mlmodelc`) instead of the default | downloaded |
+| `+palette=P` | `256`, `truecolor`, or `16` | 256 |
+| `+fg=RRGGBB`, `+bg=RRGGBB` | Override the terminal's reported colors | queried |
 | `+warmup=N` | Camera warmup frames | 3 |
+| `+smooth=S` | Steadiness 0-1: holds the dots against noise and small motion (0 = off) | 0.7 |
 | `+strategy=` | `pipelined` or `direct` | pipelined |
 
 ## Examples

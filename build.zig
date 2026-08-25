@@ -11,20 +11,46 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // C bindings for the camera wrapper. Zig 0.16 deprecates @cImport in
+    // Depth model (CoreML monocular depth). Zig 0.16 deprecates @cImport in
     // favor of translate-c driven from the build graph.
+    const depth_c = b.addTranslateC(.{
+        .root_source_file = b.path("deps/depth_model.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const depth_mod = b.addModule("depth", .{
+        .root_source_file = b.path("src/depth.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+            .{ .name = "c", .module = depth_c.createModule() },
+        },
+    });
+    depth_mod.addIncludePath(b.path("deps"));
+    depth_mod.addCSourceFile(.{
+        .file = b.path("deps/depth_model.mm"),
+        .flags = &[_][]const u8{ "-ObjC++", "-fno-objc-arc" },
+    });
+    depth_mod.link_libcpp = true;
+    depth_mod.linkFramework("CoreML", .{});
+    depth_mod.linkFramework("Vision", .{});
+    depth_mod.linkFramework("CoreVideo", .{});
+    depth_mod.linkFramework("Foundation", .{});
+
+    // C bindings for the camera wrapper
     const camera_c = b.addTranslateC(.{
         .root_source_file = b.path("deps/camera_wrapper.h"),
         .target = target,
         .optimize = optimize,
     });
 
-    // Camera module (depends on types + C bindings)
+    // Camera module (depends on types, depth model, C bindings)
     const camera_mod = b.addModule("camera", .{
         .root_source_file = b.path("src/camera.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "types", .module = types_mod },
+            .{ .name = "depth", .module = depth_mod },
             .{ .name = "c", .module = camera_c.createModule() },
         },
     });
@@ -155,6 +181,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "types", .module = types_mod },
             .{ .name = "camera", .module = camera_mod },
+            .{ .name = "depth", .module = depth_mod },
             .{ .name = "converter", .module = converter_mod },
             .{ .name = "term", .module = term_mod },
             .{ .name = "cli", .module = cli_mod },
@@ -195,11 +222,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_camera_tests = b.addRunArtifact(camera_tests);
 
-    // Converter module tests
+    // Converter module tests. `zig test` only collects tests from the root
+    // module, so each converter submodule gets its own test step.
     const converter_tests = b.addTest(.{
         .root_module = converter_mod,
     });
     const run_converter_tests = b.addRunArtifact(converter_tests);
+    const converter_submodules = [_]*std.Build.Module{ common_mod, edge_mod, atkinson_mod, floyd_steinberg_mod, blue_noise_mod, bayer_mod };
+    var run_converter_submodule_tests: [converter_submodules.len]*std.Build.Step.Run = undefined;
+    for (converter_submodules, 0..) |submod, i| {
+        run_converter_submodule_tests[i] = b.addRunArtifact(b.addTest(.{ .root_module = submod }));
+    }
+
+    // Image module tests
+    const image_tests = b.addTest(.{
+        .root_module = image_mod,
+    });
+    const run_image_tests = b.addRunArtifact(image_tests);
+
+    // Depth module tests
+    const depth_tests = b.addTest(.{
+        .root_module = depth_mod,
+    });
+    const run_depth_tests = b.addRunArtifact(depth_tests);
 
     // Terminal module tests
     const term_tests = b.addTest(.{
@@ -219,10 +264,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    // Executable (main.zig) tests
+    const exe_tests = b.addTest(.{
+        .root_module = exe.root_module,
+    });
+    const run_exe_tests = b.addRunArtifact(exe_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_camera_tests.step);
     test_step.dependOn(&run_converter_tests.step);
+    for (run_converter_submodule_tests) |run| test_step.dependOn(&run.step);
+    test_step.dependOn(&run_image_tests.step);
+    test_step.dependOn(&run_depth_tests.step);
     test_step.dependOn(&run_term_tests.step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_exe_tests.step);
 }

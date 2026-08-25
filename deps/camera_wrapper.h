@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "depth_model.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,10 +14,18 @@ typedef void* CameraHandle;
 
 // Image data structure
 typedef struct {
-    uint8_t* data;      // Grayscale pixel data
+    uint8_t* data;      // Grayscale (Y) pixel data
     uint32_t width;
     uint32_t height;
     uint32_t bytes_per_row;
+    uint8_t* chroma_data;   // Interleaved CbCr, half resolution (4:2:0)
+    uint32_t chroma_width;
+    uint32_t chroma_height;
+    uint32_t chroma_bytes_per_row;
+    uint8_t* mask_data;     // Nearness 0-255 from the depth model, own resolution; NULL when off
+    uint32_t mask_width;
+    uint32_t mask_height;
+    uint32_t mask_bytes_per_row;
 } CameraImage;
 
 // Error codes
@@ -50,6 +59,10 @@ CameraError camera_capture_frame(CameraHandle handle, CameraImage* out_image);
 
 // Check if the camera is currently open
 bool camera_is_open(CameraHandle handle);
+
+// Attach (or detach with NULL) a depth model. While attached, every captured
+// frame carries a nearness mask. The camera does not own the model.
+void camera_set_depth_model(CameraHandle handle, DepthModelHandle model);
 
 #ifdef __cplusplus
 }
