@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types");
+const Io = std.Io;
 
 // =============================================================================
 // Source configurations (tagged union)
@@ -11,6 +12,9 @@ pub const Source = union(enum) {
     cam: struct {
         warmup: u32 = 3,
         strategy: Strategy = .pipelined,
+        /// Weight of the previous frame when blending, 0-1; steadies the dots
+        /// against sensor noise. 0 = off.
+        smooth: f32 = 0.7,
     },
     file: struct {
         path: []const u8 = "",
@@ -45,12 +49,31 @@ pub const Mode = union(enum) {
 };
 
 // =============================================================================
+// Shading options (apply to every mode)
+// =============================================================================
+
+pub const Shade = struct {
+    /// Brightness channel exponent; present = channel on
+    gamma: ?f32 = null,
+    /// Color channel from the source's chroma
+    color: bool = false,
+    /// Depth: cell brightness follows nearness, far = background, near = foreground
+    depth: bool = false,
+    /// Depth model to use (.mlpackage or .mlmodelc); default downloads one
+    model: ?[]const u8 = null,
+    /// Override the terminal's reported foreground / background (RRGGBB)
+    fg: ?types.Rgb = null,
+    bg: ?types.Rgb = null,
+};
+
+// =============================================================================
 // Args struct
 // =============================================================================
 
 pub const Args = struct {
     source: Source,
     mode: Mode,
+    shade: Shade = .{},
 };
 
 // =============================================================================
@@ -88,6 +111,14 @@ fn parseValue(comptime T: type, value: []const u8) ?T {
         return null;
     } else if (T == u8 or T == u32) {
         return std.fmt.parseInt(T, value, 10) catch null;
+    } else if (T == f32) {
+        return std.fmt.parseFloat(T, value) catch null;
+    } else if (T == types.Rgb) {
+        return parseHexColor(value);
+    } else if (@typeInfo(T) == .optional) {
+        // Unwrap so a failed parse stays a failure instead of a present-but-null value
+        const inner = parseValue(@typeInfo(T).optional.child, value) orelse return null;
+        return inner;
     } else if (@typeInfo(T) == .@"enum") {
         inline for (@typeInfo(T).@"enum".fields) |field| {
             if (std.mem.eql(u8, value, field.name)) {
@@ -97,6 +128,17 @@ fn parseValue(comptime T: type, value: []const u8) ?T {
         return null;
     }
     return null;
+}
+
+/// "RRGGBB" or "#RRGGBB"
+fn parseHexColor(value: []const u8) ?types.Rgb {
+    const hex = if (value.len > 0 and value[0] == '#') value[1..] else value;
+    if (hex.len != 6) return null;
+    var rgb: types.Rgb = undefined;
+    for (0..3) |i| {
+        rgb[i] = std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16) catch return null;
+    }
+    return rgb;
 }
 
 fn setField(comptime T: type, ptr: *T, field_name: []const u8, value: ?[]const u8) ParseError!bool {
@@ -139,8 +181,10 @@ fn getActivePayload(comptime U: type, u: *U) ?struct { name: []const u8, ptr: *a
 // Main parsing
 // =============================================================================
 
-pub fn parse() CliError!?Args {
-    var iter = std.process.args();
+/// Parse process arguments. Returns null when help was requested; the caller
+/// is responsible for printing it (see `printHelp`).
+pub fn parse(io: Io, process_args: std.process.Args) CliError!?Args {
+    var iter = process_args.iterate();
     const args = try parseFromIter(&iter);
 
     if (args) |a| {
@@ -150,7 +194,7 @@ pub fn parse() CliError!?Args {
                 if (f.path.len == 0) {
                     return ValidationError.MissingFilePath;
                 }
-                try validateFile(f.path);
+                try validateFile(io, f.path);
             },
             else => {},
         }
@@ -159,6 +203,8 @@ pub fn parse() CliError!?Args {
     return args;
 }
 
+/// Parse from any iterator whose `next()` yields `?[]const u8`-compatible
+/// slices. Returns null when `+help` is encountered.
 pub fn parseFromIter(iter: anytype) ParseError!?Args {
     // Skip program name
     _ = iter.next();
@@ -166,7 +212,6 @@ pub fn parseFromIter(iter: anytype) ParseError!?Args {
     // First arg: must be +source=X or +help
     const first = iter.next() orelse return ParseError.MissingSource;
     if (std.mem.eql(u8, first, "+help")) {
-        printHelp();
         return null;
     }
     if (!std.mem.startsWith(u8, first, "+source=")) {
@@ -180,11 +225,11 @@ pub fn parseFromIter(iter: anytype) ParseError!?Args {
         return ParseError.MissingMode;
     }
     var mode = initVariant(Mode, second["+mode=".len..]) orelse return ParseError.UnknownMode;
+    var shade: Shade = .{};
 
-    // Remaining args: distribute to source or mode based on field name
+    // Remaining args: distribute to source, mode, or shading based on field name
     while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "+help")) {
-            printHelp();
             return null;
         }
 
@@ -201,19 +246,31 @@ pub fn parseFromIter(iter: anytype) ParseError!?Args {
             value = rest[eq_pos + 1 ..];
         }
 
-        // Try source first, then mode
+        // Try source first, then mode, then shading
         const found_in_source = try setFieldOnUnion(Source, &source, field_name, value);
         if (!found_in_source) {
             const found_in_mode = try setFieldOnUnion(Mode, &mode, field_name, value);
             if (!found_in_mode) {
-                return ParseError.UnknownArgument;
+                const found_in_shade = try setField(Shade, &shade, field_name, value);
+                if (!found_in_shade) {
+                    return ParseError.UnknownArgument;
+                }
             }
         }
+    }
+
+    if (shade.gamma) |g| {
+        if (!(g > 0) or !std.math.isFinite(g)) return ParseError.InvalidValue;
+    }
+    switch (source) {
+        .cam => |c| if (!(c.smooth >= 0 and c.smooth <= 1)) return ParseError.InvalidValue,
+        else => {},
     }
 
     return Args{
         .source = source,
         .mode = mode,
+        .shade = shade,
     };
 }
 
@@ -265,14 +322,14 @@ fn detectFormat(header: []const u8) ImageFormat {
     return .unknown;
 }
 
-fn validateFile(path: []const u8) ValidationError!void {
-    const file = std.fs.cwd().openFile(path, .{}) catch {
+fn validateFile(io: Io, path: []const u8) ValidationError!void {
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch {
         return ValidationError.FileNotFound;
     };
-    defer file.close();
+    defer file.close(io);
 
     var header: [8]u8 = undefined;
-    const bytes_read = file.read(&header) catch {
+    const bytes_read = file.readStreaming(io, &.{&header}) catch {
         return ValidationError.FileReadError;
     };
 
@@ -285,7 +342,7 @@ fn validateFile(path: []const u8) ValidationError!void {
 // Help
 // =============================================================================
 
-pub fn printHelp() void {
+pub fn printHelp(io: Io) void {
     const help_text =
         \\dith - Terminal dithering tool
         \\
@@ -296,6 +353,8 @@ pub fn printHelp() void {
         \\    cam                Live camera feed
         \\      +warmup=<N>        Warmup frames (default: 3)
         \\      +strategy=<S>      direct | pipelined (default: pipelined)
+        \\      +smooth=<S>        Steadiness, 0-1: holds the dots against noise and small
+        \\                         motion (default: 0.7, 0 = off)
         \\
         \\    file               Image file
         \\      +path=<PATH>       Path to image file (required)
@@ -321,22 +380,39 @@ pub fn printHelp() void {
         \\      +threshold=<N>     Threshold adjustment 0-255 (default: 128)
         \\      +invert            Invert output
         \\
+        \\SHADING (any mode, off by default; only your terminal's own
+        \\colors are used, mixed across cells):
+        \\    +gamma=<G>         Shade dots by brightness, curve exponent G
+        \\                       (0.55 compensates the dither's washed-out midtones;
+        \\                        lower = brighter shadows, higher = deeper contrast)
+        \\    +color             Color dots from the camera or image
+        \\    +depth             Brightness follows distance: near things in the
+        \\                       foreground color, far things fade to the background.
+        \\                       Uses an on-device depth model (downloaded to ~/.cache/dith)
+        \\    +model=<PATH>      Depth model to use instead (.mlpackage or .mlmodelc)
+        \\    +fg=RRGGBB         Override the terminal's foreground color
+        \\    +bg=RRGGBB         Override the terminal's background color
+        \\
+        \\    dith +theme        Show the colors your terminal reports
+        \\
         \\EXAMPLES:
         \\    dith +source=cam +mode=edge
         \\    dith +source=cam +mode=blue_noise
         \\    dith +source=file +mode=atkinson +path=photo.png +invert
+        \\    dith +source=cam +mode=floyd_steinberg +gamma=0.55 +color
+        \\    dith +source=cam +mode=atkinson +color +depth
         \\
     ;
     var buffer: [4096]u8 = undefined;
-    var writer = std.fs.File.stderr().writer(&buffer);
+    var writer = Io.File.stderr().writerStreaming(io, &buffer);
     const stderr = &writer.interface;
     stderr.writeAll(help_text) catch {};
     stderr.flush() catch {};
 }
 
-pub fn printErrorAndHelp(err: CliError) void {
+pub fn printErrorAndHelp(io: Io, err: CliError) void {
     var buffer: [1024]u8 = undefined;
-    var writer = std.fs.File.stderr().writer(&buffer);
+    var writer = Io.File.stderr().writerStreaming(io, &buffer);
     const stderr = &writer.interface;
     const msg: []const u8 = switch (err) {
         ParseError.MissingSource => "error: +source is required\n\n",
@@ -353,7 +429,7 @@ pub fn printErrorAndHelp(err: CliError) void {
     };
     stderr.writeAll(msg) catch {};
     stderr.flush() catch {};
-    printHelp();
+    printHelp(io);
 }
 
 // =============================================================================
@@ -479,6 +555,53 @@ test "parse file source with path" {
         },
         else => unreachable,
     }
+}
+
+test "parse shading options" {
+    var iter = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+gamma=0.8", "+color" } };
+    const args = try parseFromIter(&iter);
+    try std.testing.expect(args != null);
+    try std.testing.expectEqual(@as(f32, 0.8), args.?.shade.gamma.?);
+    try std.testing.expectEqual(true, args.?.shade.color);
+}
+
+test "parse shading defaults to off" {
+    var iter = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer" } };
+    const args = try parseFromIter(&iter);
+    try std.testing.expectEqual(@as(?f32, null), args.?.shade.gamma);
+    try std.testing.expectEqual(false, args.?.shade.color);
+    try std.testing.expectEqual(false, args.?.shade.depth);
+    try std.testing.expectEqual(@as(?types.Rgb, null), args.?.shade.fg);
+}
+
+test "parse smooth" {
+    var iter = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+smooth=0" } };
+    const args = try parseFromIter(&iter);
+    try std.testing.expectEqual(@as(f32, 0), args.?.source.cam.smooth);
+    var bad = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+smooth=1.5" } };
+    try std.testing.expectError(ParseError.InvalidValue, parseFromIter(&bad));
+}
+
+test "parse depth and theme overrides" {
+    var iter = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+depth", "+fg=#ffcc00", "+bg=101010" } };
+    const args = try parseFromIter(&iter);
+    try std.testing.expectEqual(true, args.?.shade.depth);
+    try std.testing.expectEqual(types.Rgb{ 0xff, 0xcc, 0x00 }, args.?.shade.fg.?);
+    try std.testing.expectEqual(types.Rgb{ 0x10, 0x10, 0x10 }, args.?.shade.bg.?);
+}
+
+test "parse rejects bad colors" {
+    var iter1 = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+fg=zzz" } };
+    try std.testing.expectError(ParseError.InvalidValue, parseFromIter(&iter1));
+}
+
+test "parse rejects bad gamma" {
+    var iter1 = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+gamma=0" } };
+    try std.testing.expectError(ParseError.InvalidValue, parseFromIter(&iter1));
+    var iter2 = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+gamma=abc" } };
+    try std.testing.expectError(ParseError.InvalidValue, parseFromIter(&iter2));
+    var iter3 = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+gamma" } };
+    try std.testing.expectError(ParseError.MissingValue, parseFromIter(&iter3));
 }
 
 test "parse unknown source" {

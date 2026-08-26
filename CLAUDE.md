@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build System & Commands
 
-This project uses Zig's build system. Minimum Zig version: **0.15.1**
+This project uses Zig's build system. Minimum Zig version: **0.16.0**
 
 **Build and run:**
 ```bash

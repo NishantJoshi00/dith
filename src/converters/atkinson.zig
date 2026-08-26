@@ -15,6 +15,17 @@ pub const AtkinsonConverter = struct {
     allocator: std.mem.Allocator,
     threshold: i16, // Threshold for binarization (typically 128)
     invert: bool,
+    shading: common.Shading = .none,
+    /// Last frame's dot map, reused as this frame's output buffer. Error
+    /// diffusion is chaotic (one changed pixel re-rolls everything below and
+    /// right of it), so when the frame says which pixels changed, only those
+    /// and a small margin are re-dithered; the rest keep their dots.
+    dots: []u8 = &.{},
+    /// Each pixel's quantization error from the last time it was computed.
+    /// Pixels that keep their dots still hand this error to their
+    /// neighbours, so a re-dithered patch continues the surrounding pattern
+    /// instead of restarting it.
+    errors: []i16 = &.{},
 
     const Self = @This();
 
@@ -46,7 +57,26 @@ pub const AtkinsonConverter = struct {
     fn deinitImpl(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const allocator = self.allocator;
+        allocator.free(self.dots);
+        allocator.free(self.errors);
         allocator.destroy(self);
+    }
+
+    /// The persistent dot map, resized to the frame. `fresh` is set when
+    /// there is no previous frame to keep dots from.
+    fn dotBuffer(self: *Self, len: usize, fresh: *bool) ![]u8 {
+        fresh.* = self.dots.len != len;
+        if (fresh.*) {
+            self.allocator.free(self.dots);
+            self.dots = &.{};
+            self.dots = try self.allocator.alloc(u8, len);
+            @memset(self.dots, 0);
+            self.allocator.free(self.errors);
+            self.errors = &.{};
+            self.errors = try self.allocator.alloc(i16, len);
+            @memset(self.errors, 0);
+        }
+        return self.dots;
     }
 
     pub fn imageToText(
@@ -59,9 +89,13 @@ pub const AtkinsonConverter = struct {
         const width = image.width;
         const height = image.height;
 
-        // Output binary buffer
-        var binary = try allocator.alloc(u8, width * height);
-        defer allocator.free(binary);
+        // Output dot map, carried over from last frame
+        var fresh = false;
+        const binary = try self.dotBuffer(width * height, &fresh);
+
+        // Pixels to re-dither: the changed ones plus a margin, or everything
+        const redo: ?[]u8 = if (!fresh and image.changed != null) try common.dilateChanged(image.changed.?, width, height, allocator) else null;
+        defer if (redo) |r| allocator.free(r);
 
         // Rolling error buffers - need 3 rows for Atkinson (current, y+1, y+2)
         var err_row0 = try allocator.alloc(i16, width); // current row
@@ -87,15 +121,25 @@ pub const AtkinsonConverter = struct {
             const row_offset = y * width;
 
             for (0..width) |x| {
-                // Get pixel value + accumulated error
-                const pixel: i16 = @as(i16, image.data[row_offset + x]) + err_row0[x];
+                const idx = row_offset + x;
+                var err: i16 = undefined;
+                const keep = if (redo) |r| r[idx] == 0 else false;
+                if (keep) {
+                    // Unchanged pixel: keep its dot, but still pass on the
+                    // error it produced last time so neighbours stay continuous
+                    err = self.errors[idx];
+                } else {
+                    // Get pixel value + accumulated error
+                    const pixel: i16 = @as(i16, image.data[idx]) + err_row0[x];
 
-                // Threshold to black or white
-                const output: u8 = if (pixel >= threshold) 255 else 0;
-                binary[row_offset + x] = output;
+                    // Threshold to black or white
+                    const output: u8 = if (pixel >= threshold) 255 else 0;
+                    binary[idx] = output;
 
-                // Calculate quantization error (only 75% distributed)
-                const err = pixel - @as(i16, output);
+                    // Calculate quantization error (only 75% distributed)
+                    err = pixel - @as(i16, output);
+                    self.errors[idx] = err;
+                }
                 // Atkinson: 1/8 to each of 6 neighbors = 6/8 = 75% total
                 const err_frac = @divTrunc(err, 8);
 
@@ -137,7 +181,7 @@ pub const AtkinsonConverter = struct {
             @memset(err_row2, 0);
         }
 
-        return binaryToBraille(binary, width, height, target_cols, target_rows, self.invert, allocator);
+        return binaryToBraille(binary, image, target_cols, target_rows, self.invert, self.shading, allocator);
     }
 };
 

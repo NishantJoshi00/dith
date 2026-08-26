@@ -42,9 +42,29 @@ dith +source=cam +mode=edge +threshold=50
 dith +source=file +mode=bayer +path=image.jpg +invert
 ```
 
+**Add brightness, color and depth:**
+
+```bash
+# Shade dots by brightness (0.55 lifts the dither's washed-out midtones)
+dith +source=cam +mode=floyd_steinberg +gamma=0.55
+
+# Color dots from the camera, with brightness shading
+dith +source=cam +mode=atkinson +gamma=0.55 +color
+
+# Depth: near things in the foreground color, far things fading into the background
+dith +source=cam +mode=atkinson +depth
+
+# Still images work the same way
+dith +source=file +mode=blue_noise +path=photo.png +color +gamma=0.55
+```
+
+Shading uses only your terminal's own colors — `dith` asks the terminal for its foreground, background and 16-color palette (`dith +theme` shows the answer; `+fg`/`+bg` override the first two). Each cell is painted with the entry that best completes its dots and the difference is carried into the neighbouring cells, so tones between entries appear as mixtures. All channels are off unless asked for, so plain output stays as fast as before.
+
+`+depth` runs [Depth Anything V2 (small)](https://huggingface.co/apple/coreml-depth-anything-v2-small) on the Neural Engine. The first use downloads the model (48 MB) into `~/.cache/dith` and compiles it there once; pass `+model=` to use your own.
+
 ## Install
 
-**Requirements:** Zig 0.15.1+, macOS (for camera source)
+**Requirements:** Zig 0.16.0+, macOS (for camera source)
 
 ```bash
 git clone https://github.com/user/dith
@@ -81,7 +101,13 @@ dith +source=file +mode=bayer +path=~/Downloads/image.jpg +invert
 |--------|-------------|---------|
 | `+threshold=N` | Sensitivity 0-255 | varies by mode |
 | `+invert` | Flip black/white | off |
+| `+gamma=G` | Shade dots by brightness with curve exponent G (lower = brighter shadows) | off |
+| `+color` | Color dots from the source's chroma | off |
+| `+depth` | Brightness follows distance: near = foreground color, far = background | off |
+| `+model=PATH` | Depth model (`.mlpackage` or `.mlmodelc`) instead of the default | downloaded |
+| `+fg=RRGGBB`, `+bg=RRGGBB` | Override the terminal's reported colors | queried |
 | `+warmup=N` | Camera warmup frames | 3 |
+| `+smooth=S` | Steadiness 0-1: holds the dots against noise and small motion (0 = off) | 0.7 |
 | `+strategy=` | `pipelined` or `direct` | pipelined |
 
 ## Examples

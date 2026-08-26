@@ -4,7 +4,7 @@ const common = @import("common");
 const Image = common.Image;
 const Converter = common.Converter;
 const BRAILLE_DOT_POSITIONS = common.BRAILLE_DOT_POSITIONS;
-const encodeUtf8Braille = common.encodeUtf8Braille;
+const encodeBraille = common.encodeBraille;
 const absDiff = common.absDiff;
 
 /// Edge detection converter using gradient-based rendering
@@ -13,6 +13,7 @@ pub const EdgeConverter = struct {
     allocator: std.mem.Allocator,
     threshold: u8, // Threshold for edge detection gradient (0-255)
     invert: bool, // Invert output
+    shading: common.Shading = .none,
 
     const Self = @This();
 
@@ -56,65 +57,46 @@ pub const EdgeConverter = struct {
         target_rows: u32,
         allocator: std.mem.Allocator,
     ) ![]u8 {
-        const output_width = target_cols;
-        const output_height = target_rows;
-
-        // Calculate scaling factors (from output space to source image space)
-        const scale_x = @as(f32, @floatFromInt(image.width)) / @as(f32, @floatFromInt(output_width * 2));
-        const scale_y = @as(f32, @floatFromInt(image.height)) / @as(f32, @floatFromInt(output_height * 4));
-
-        // Each Braille char is 3 bytes in UTF-8, plus newline per row
-        const bytes_per_row = output_width * 3 + 1;
-        const total_bytes = output_height * bytes_per_row;
-
-        var buffer = try allocator.alloc(u8, total_bytes);
-        var buf_offset: usize = 0;
-
-        var row: u32 = 0;
-        while (row < output_height) : (row += 1) {
-            var col: u32 = 0;
-            while (col < output_width) : (col += 1) {
-                const braille_char = self.pixelBlockToBraille(image, col, row, scale_x, scale_y);
-                buf_offset += encodeUtf8Braille(braille_char, buffer[buf_offset..]);
-            }
-
-            buffer[buf_offset] = '\n';
-            buf_offset += 1;
-        }
-
-        return buffer;
+        const sampler = EdgeSampler{
+            .conv = self,
+            .image = image,
+            // Scaling factors from output space to source image space
+            .scale_x = @as(f32, @floatFromInt(image.width)) / @as(f32, @floatFromInt(target_cols * 2)),
+            .scale_y = @as(f32, @floatFromInt(image.height)) / @as(f32, @floatFromInt(target_rows * 4)),
+        };
+        return encodeBraille(sampler, image, target_cols, target_rows, self.invert, self.shading, allocator);
     }
 
-    /// Convert 2x4 pixel block to Braille character using edge detection
-    fn pixelBlockToBraille(
-        self: *Self,
+    /// Produces the 2x4 dot pattern for one cell using edge detection
+    const EdgeSampler = struct {
+        conv: *Self,
         image: Image,
-        col: u32,
-        row: u32,
         scale_x: f32,
         scale_y: f32,
-    ) u21 {
-        var pattern: u8 = 0;
 
-        const base_out_x = col * 2;
-        const base_out_y = row * 4;
+        pub inline fn pattern(s: EdgeSampler, col: u32, row: u32) u8 {
+            var bits: u8 = 0;
 
-        for (BRAILLE_DOT_POSITIONS, 0..) |pos, i| {
-            const out_x = base_out_x + pos[0];
-            const out_y = base_out_y + pos[1];
+            const base_out_x = col * 2;
+            const base_out_y = row * 4;
 
-            const src_x = @as(u32, @intFromFloat(@as(f32, @floatFromInt(out_x)) * scale_x));
-            const src_y = @as(u32, @intFromFloat(@as(f32, @floatFromInt(out_y)) * scale_y));
+            for (BRAILLE_DOT_POSITIONS, 0..) |pos, i| {
+                const out_x = base_out_x + pos[0];
+                const out_y = base_out_y + pos[1];
 
-            if (src_x < image.width and src_y < image.height) {
-                if (self.shouldDrawDot(image, src_x, src_y)) {
-                    pattern |= @as(u8, 1) << @intCast(i);
+                const src_x = @as(u32, @intFromFloat(@as(f32, @floatFromInt(out_x)) * s.scale_x));
+                const src_y = @as(u32, @intFromFloat(@as(f32, @floatFromInt(out_y)) * s.scale_y));
+
+                if (src_x < s.image.width and src_y < s.image.height) {
+                    if (s.conv.shouldDrawDot(s.image, src_x, src_y)) {
+                        bits |= @as(u8, 1) << @intCast(i);
+                    }
                 }
             }
-        }
 
-        return 0x2800 + @as(u21, pattern);
-    }
+            return bits;
+        }
+    };
 
     /// Determine if a dot should be drawn using edge detection
     /// Places dots where gradients/edges are detected
