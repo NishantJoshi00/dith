@@ -8,6 +8,42 @@
 // time so the picture does not pump when someone walks in or out of frame.
 static const float kRangeEase = 0.15f;
 
+// The model works in 14x14 patches and its map keeps that grid. A box blur
+// about a patch wide smooths the steps out before the map becomes nearness.
+static const int kBlurRadius = 7;
+
+// Separable box blur in place, using `scratch` (same size) as a temporary
+static void boxBlur(float* map, float* scratch, size_t width, size_t height, int radius) {
+    // Horizontal
+    for (size_t y = 0; y < height; y++) {
+        const float* row = map + y * width;
+        float* out = scratch + y * width;
+        float sum = 0;
+        int count = 0;
+        for (int x = 0; x < radius && x < (int)width; x++) { sum += row[x]; count++; }
+        for (size_t x = 0; x < width; x++) {
+            int add = (int)x + radius;
+            if (add < (int)width) { sum += row[add]; count++; }
+            int drop = (int)x - radius - 1;
+            if (drop >= 0) { sum -= row[drop]; count--; }
+            out[x] = sum / count;
+        }
+    }
+    // Vertical
+    for (size_t x = 0; x < width; x++) {
+        float sum = 0;
+        int count = 0;
+        for (int y = 0; y < radius && y < (int)height; y++) { sum += scratch[y * width + x]; count++; }
+        for (size_t y = 0; y < height; y++) {
+            int add = (int)y + radius;
+            if (add < (int)height) { sum += scratch[add * width + x]; count++; }
+            int drop = (int)y - radius - 1;
+            if (drop >= 0) { sum -= scratch[drop * width + x]; count--; }
+            map[y * width + x] = sum / count;
+        }
+    }
+}
+
 @interface DepthModel : NSObject
 {
     VNCoreMLModel* model;
@@ -17,6 +53,9 @@ static const float kRangeEase = 0.15f;
     size_t mapDataSize;
     uint32_t mapWidth;
     uint32_t mapHeight;
+    float* floatMap;      // depth as floats, blurred before normalization
+    float* floatScratch;
+    size_t floatCount;
 
     float rangeLo;
     float rangeHi;
@@ -66,6 +105,9 @@ static NSURL* compilePackage(NSURL* packageURL, NSError** error) {
         mapDataSize = 0;
         mapWidth = 0;
         mapHeight = 0;
+        floatMap = nullptr;
+        floatScratch = nullptr;
+        floatCount = 0;
         rangeLo = 0;
         rangeHi = 0;
         haveRange = false;
@@ -79,6 +121,12 @@ static NSURL* compilePackage(NSURL* packageURL, NSError** error) {
     [model release];
     if (mapData) {
         free(mapData);
+    }
+    if (floatMap) {
+        free(floatMap);
+    }
+    if (floatScratch) {
+        free(floatScratch);
     }
     if (scratch) {
         CVPixelBufferRelease(scratch);
@@ -155,26 +203,42 @@ static NSURL* compilePackage(NSURL* packageURL, NSError** error) {
         mapData = (uint8_t*)malloc(size);
         mapDataSize = size;
     }
+    if (!floatMap || floatCount != size) {
+        free(floatMap);
+        free(floatScratch);
+        floatMap = (float*)malloc(size * sizeof(float));
+        floatScratch = (float*)malloc(size * sizeof(float));
+        floatCount = size;
+    }
     mapWidth = (uint32_t)width;
     mapHeight = (uint32_t)height;
 
-    // Pass 1: this frame's range
-    float lo = INFINITY;
-    float hi = -INFINITY;
+    // Read the model output as floats
     for (size_t y = 0; y < height; y++) {
         const uint8_t* row = base + y * bytesPerRow;
+        float* out = floatMap + y * width;
         for (size_t x = 0; x < width; x++) {
-            float v;
             if (format == kCVPixelFormatType_OneComponent16Half) {
-                v = (float)((const _Float16*)row)[x];
+                out[x] = (float)((const _Float16*)row)[x];
             } else if (format == kCVPixelFormatType_OneComponent32Float) {
-                v = ((const float*)row)[x];
+                out[x] = ((const float*)row)[x];
             } else {
-                v = row[x];
+                out[x] = row[x];
             }
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
         }
+    }
+    CVPixelBufferUnlockBaseAddress(depth, kCVPixelBufferLock_ReadOnly);
+
+    // Smooth away the model's patch grid
+    boxBlur(floatMap, floatScratch, width, height, kBlurRadius);
+
+    // This frame's range, eased into the running one
+    float lo = INFINITY;
+    float hi = -INFINITY;
+    for (size_t i = 0; i < size; i++) {
+        float v = floatMap[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
     }
     if (!haveRange) {
         rangeLo = lo;
@@ -187,27 +251,14 @@ static NSURL* compilePackage(NSURL* packageURL, NSError** error) {
     float span = rangeHi - rangeLo;
     float scale = span > 1e-6f ? 255.0f / span : 0.0f;
 
-    // Pass 2: larger model output = nearer, mapped to 0..255
-    for (size_t y = 0; y < height; y++) {
-        const uint8_t* row = base + y * bytesPerRow;
-        uint8_t* out = mapData + y * width;
-        for (size_t x = 0; x < width; x++) {
-            float v;
-            if (format == kCVPixelFormatType_OneComponent16Half) {
-                v = (float)((const _Float16*)row)[x];
-            } else if (format == kCVPixelFormatType_OneComponent32Float) {
-                v = ((const float*)row)[x];
-            } else {
-                v = row[x];
-            }
-            float n = (v - rangeLo) * scale;
-            if (n < 0) n = 0;
-            if (n > 255) n = 255;
-            out[x] = (uint8_t)(n + 0.5f);
-        }
+    // Larger model output = nearer, mapped to 0..255
+    for (size_t i = 0; i < size; i++) {
+        float n = (floatMap[i] - rangeLo) * scale;
+        if (n < 0) n = 0;
+        if (n > 255) n = 255;
+        mapData[i] = (uint8_t)(n + 0.5f);
     }
 
-    CVPixelBufferUnlockBaseAddress(depth, kCVPixelBufferLock_ReadOnly);
     return DEPTH_OK;
 }
 

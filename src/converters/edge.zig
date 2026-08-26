@@ -60,7 +60,6 @@ pub const EdgeConverter = struct {
         const sampler = EdgeSampler{
             .conv = self,
             .image = image,
-            .gate = common.MaskGate.from(image, self.shading),
             // Scaling factors from output space to source image space
             .scale_x = @as(f32, @floatFromInt(image.width)) / @as(f32, @floatFromInt(target_cols * 2)),
             .scale_y = @as(f32, @floatFromInt(image.height)) / @as(f32, @floatFromInt(target_rows * 4)),
@@ -74,7 +73,6 @@ pub const EdgeConverter = struct {
         image: Image,
         scale_x: f32,
         scale_y: f32,
-        gate: ?common.MaskGate,
 
         pub inline fn pattern(s: EdgeSampler, col: u32, row: u32) u8 {
             var bits: u8 = 0;
@@ -90,9 +88,7 @@ pub const EdgeConverter = struct {
                 const src_y = @as(u32, @intFromFloat(@as(f32, @floatFromInt(out_y)) * s.scale_y));
 
                 if (src_x < s.image.width and src_y < s.image.height) {
-                    var draw = s.conv.shouldDrawDot(s.image, src_x, src_y);
-                    if (draw and s.gate != null) draw = s.gate.?.allows(src_x, src_y, s.image.width, s.image.height);
-                    if (draw) {
+                    if (s.conv.shouldDrawDot(s.image, src_x, src_y)) {
                         bits |= @as(u8, 1) << @intCast(i);
                     }
                 }

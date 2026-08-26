@@ -21,6 +21,11 @@ pub const FloydSteinbergConverter = struct {
     /// right of it), so when the frame says which pixels changed, only those
     /// and a small margin are re-dithered; the rest keep their dots.
     dots: []u8 = &.{},
+    /// Each pixel's quantization error from the last time it was computed.
+    /// Pixels that keep their dots still hand this error to their
+    /// neighbours, so a re-dithered patch continues the surrounding pattern
+    /// instead of restarting it.
+    errors: []i16 = &.{},
 
     const Self = @This();
 
@@ -53,6 +58,7 @@ pub const FloydSteinbergConverter = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const allocator = self.allocator;
         allocator.free(self.dots);
+        allocator.free(self.errors);
         allocator.destroy(self);
     }
 
@@ -65,6 +71,10 @@ pub const FloydSteinbergConverter = struct {
             self.dots = &.{};
             self.dots = try self.allocator.alloc(u8, len);
             @memset(self.dots, 0);
+            self.allocator.free(self.errors);
+            self.errors = &.{};
+            self.errors = try self.allocator.alloc(i16, len);
+            @memset(self.errors, 0);
         }
         return self.dots;
     }
@@ -108,18 +118,25 @@ pub const FloydSteinbergConverter = struct {
             const row_offset = y * width;
 
             for (0..width) |x| {
-                // Unchanged pixel: keep last frame's dot; error reaching it is dropped
-                if (redo) |r| if (r[row_offset + x] == 0) continue;
+                const idx = row_offset + x;
+                var err: i16 = undefined;
+                const keep = if (redo) |r| r[idx] == 0 else false;
+                if (keep) {
+                    // Unchanged pixel: keep its dot, but still pass on the
+                    // error it produced last time so neighbours stay continuous
+                    err = self.errors[idx];
+                } else {
+                    // Get pixel value + accumulated error
+                    const pixel: i16 = @as(i16, image.data[idx]) + err_curr[x];
 
-                // Get pixel value + accumulated error
-                const pixel: i16 = @as(i16, image.data[row_offset + x]) + err_curr[x];
+                    // Threshold to black or white
+                    const output: u8 = if (pixel >= threshold) 255 else 0;
+                    binary[idx] = output;
 
-                // Threshold to black or white
-                const output: u8 = if (pixel >= threshold) 255 else 0;
-                binary[row_offset + x] = output;
-
-                // Calculate quantization error
-                const err = pixel - @as(i16, output);
+                    // Calculate quantization error
+                    err = pixel - @as(i16, output);
+                    self.errors[idx] = err;
+                }
 
                 // Distribute error using bit shifts for speed (approximates /16)
                 // 7/16 ≈ 7>>4, 5/16 ≈ 5>>4, 3/16 ≈ 3>>4, 1/16 ≈ 1>>4

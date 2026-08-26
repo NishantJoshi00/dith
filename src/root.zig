@@ -9,3 +9,4 @@ pub const converter = @import("converter");
 pub const term = @import("term");
 pub const cli = @import("cli");
 pub const image = @import("image");
+pub const resample = @import("resample");

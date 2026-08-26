@@ -56,13 +56,6 @@ pub const ImageFormat = enum {
 /// 8-bit RGB triple
 pub const Rgb = [3]u8;
 
-/// How colors are sent to the terminal
-pub const Palette = enum {
-    truecolor,
-    @"256",
-    @"16",
-};
-
 /// The terminal's own colors: shading ranges run from `bg` to `fg`
 pub const Theme = struct {
     fg: Rgb,

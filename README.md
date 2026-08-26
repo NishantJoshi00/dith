@@ -51,14 +51,14 @@ dith +source=cam +mode=floyd_steinberg +gamma=0.55
 # Color dots from the camera, with brightness shading
 dith +source=cam +mode=atkinson +gamma=0.55 +color
 
-# Depth: keep only what's near the camera, leave the rest empty
-dith +source=cam +mode=atkinson +depth=100
+# Depth: near things in the foreground color, far things fading into the background
+dith +source=cam +mode=atkinson +depth
 
-# Truecolor instead of the default 256-color palette
-dith +source=file +mode=blue_noise +path=photo.png +color +palette=truecolor
+# Still images work the same way
+dith +source=file +mode=blue_noise +path=photo.png +color +gamma=0.55
 ```
 
-Shading ranges run from your terminal's background to its foreground — `dith` asks the terminal for them (`dith +theme` shows the answer) and `+fg`/`+bg` override it. All channels are off unless asked for, so plain output stays as fast as before.
+Shading uses only your terminal's own colors — `dith` asks the terminal for its foreground, background and 16-color palette (`dith +theme` shows the answer; `+fg`/`+bg` override the first two). Each cell is painted with the entry that best completes its dots and the difference is carried into the neighbouring cells, so tones between entries appear as mixtures. All channels are off unless asked for, so plain output stays as fast as before.
 
 `+depth` runs [Depth Anything V2 (small)](https://huggingface.co/apple/coreml-depth-anything-v2-small) on the Neural Engine. The first use downloads the model (48 MB) into `~/.cache/dith` and compiles it there once; pass `+model=` to use your own.
 
@@ -103,9 +103,8 @@ dith +source=file +mode=bayer +path=~/Downloads/image.jpg +invert
 | `+invert` | Flip black/white | off |
 | `+gamma=G` | Shade dots by brightness with curve exponent G (lower = brighter shadows) | off |
 | `+color` | Color dots from the source's chroma | off |
-| `+depth=N` | How far into the scene to keep; 0 = only the nearest thing, 255 = everything | off |
+| `+depth` | Brightness follows distance: near = foreground color, far = background | off |
 | `+model=PATH` | Depth model (`.mlpackage` or `.mlmodelc`) instead of the default | downloaded |
-| `+palette=P` | `256`, `truecolor`, or `16` | 256 |
 | `+fg=RRGGBB`, `+bg=RRGGBB` | Override the terminal's reported colors | queried |
 | `+warmup=N` | Camera warmup frames | 3 |
 | `+smooth=S` | Steadiness 0-1: holds the dots against noise and small motion (0 = off) | 0.7 |

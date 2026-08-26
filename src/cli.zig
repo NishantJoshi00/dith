@@ -52,20 +52,15 @@ pub const Mode = union(enum) {
 // Shading options (apply to every mode)
 // =============================================================================
 
-pub const Palette = types.Palette;
-
 pub const Shade = struct {
     /// Brightness channel exponent; present = channel on
     gamma: ?f32 = null,
     /// Color channel from the source's chroma
     color: bool = false,
-    /// Depth: how far into the scene to keep, 0 = only what's nearest,
-    /// 255 = everything; present = on
-    depth: ?u8 = null,
+    /// Depth: cell brightness follows nearness, far = background, near = foreground
+    depth: bool = false,
     /// Depth model to use (.mlpackage or .mlmodelc); default downloads one
     model: ?[]const u8 = null,
-    /// How colors are sent to the terminal
-    palette: Palette = .@"256",
     /// Override the terminal's reported foreground / background (RRGGBB)
     fg: ?types.Rgb = null,
     bg: ?types.Rgb = null,
@@ -385,17 +380,16 @@ pub fn printHelp(io: Io) void {
         \\      +threshold=<N>     Threshold adjustment 0-255 (default: 128)
         \\      +invert            Invert output
         \\
-        \\SHADING (any mode, off by default; ranges run from your
-        \\terminal's background to its foreground):
+        \\SHADING (any mode, off by default; only your terminal's own
+        \\colors are used, mixed across cells):
         \\    +gamma=<G>         Shade dots by brightness, curve exponent G
         \\                       (0.55 compensates the dither's washed-out midtones;
         \\                        lower = brighter shadows, higher = deeper contrast)
         \\    +color             Color dots from the camera or image
-        \\    +depth=<N>         How far into the scene to keep, 0-255: 0 = only the
-        \\                       nearest thing, 255 = everything. Uses an on-device
-        \\                       depth model (downloaded to ~/.cache/dith on first use)
+        \\    +depth             Brightness follows distance: near things in the
+        \\                       foreground color, far things fade to the background.
+        \\                       Uses an on-device depth model (downloaded to ~/.cache/dith)
         \\    +model=<PATH>      Depth model to use instead (.mlpackage or .mlmodelc)
-        \\    +palette=<P>       256 | truecolor | 16 (default: 256)
         \\    +fg=RRGGBB         Override the terminal's foreground color
         \\    +bg=RRGGBB         Override the terminal's background color
         \\
@@ -406,7 +400,7 @@ pub fn printHelp(io: Io) void {
         \\    dith +source=cam +mode=blue_noise
         \\    dith +source=file +mode=atkinson +path=photo.png +invert
         \\    dith +source=cam +mode=floyd_steinberg +gamma=0.55 +color
-        \\    dith +source=cam +mode=atkinson +color +depth=128
+        \\    dith +source=cam +mode=atkinson +color +depth
         \\
     ;
     var buffer: [4096]u8 = undefined;
@@ -576,8 +570,7 @@ test "parse shading defaults to off" {
     const args = try parseFromIter(&iter);
     try std.testing.expectEqual(@as(?f32, null), args.?.shade.gamma);
     try std.testing.expectEqual(false, args.?.shade.color);
-    try std.testing.expectEqual(@as(?u8, null), args.?.shade.depth);
-    try std.testing.expectEqual(Palette.@"256", args.?.shade.palette);
+    try std.testing.expectEqual(false, args.?.shade.depth);
     try std.testing.expectEqual(@as(?types.Rgb, null), args.?.shade.fg);
 }
 
@@ -589,20 +582,17 @@ test "parse smooth" {
     try std.testing.expectError(ParseError.InvalidValue, parseFromIter(&bad));
 }
 
-test "parse depth, palette and theme overrides" {
-    var iter = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+depth=12", "+palette=16", "+fg=#ffcc00", "+bg=101010" } };
+test "parse depth and theme overrides" {
+    var iter = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+depth", "+fg=#ffcc00", "+bg=101010" } };
     const args = try parseFromIter(&iter);
-    try std.testing.expectEqual(@as(u8, 12), args.?.shade.depth.?);
-    try std.testing.expectEqual(Palette.@"16", args.?.shade.palette);
+    try std.testing.expectEqual(true, args.?.shade.depth);
     try std.testing.expectEqual(types.Rgb{ 0xff, 0xcc, 0x00 }, args.?.shade.fg.?);
     try std.testing.expectEqual(types.Rgb{ 0x10, 0x10, 0x10 }, args.?.shade.bg.?);
 }
 
-test "parse rejects bad colors and palettes" {
+test "parse rejects bad colors" {
     var iter1 = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+fg=zzz" } };
     try std.testing.expectError(ParseError.InvalidValue, parseFromIter(&iter1));
-    var iter2 = SliceIter{ .slice = &.{ "dith", "+source=cam", "+mode=bayer", "+palette=cga" } };
-    try std.testing.expectError(ParseError.InvalidValue, parseFromIter(&iter2));
 }
 
 test "parse rejects bad gamma" {

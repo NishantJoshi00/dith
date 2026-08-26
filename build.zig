@@ -159,6 +159,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Resample module (depends on types)
+    const resample_mod = b.addModule("resample", .{
+        .root_source_file = b.path("src/resample.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+        },
+    });
+
     // Image module (depends on types, uses stb_image)
     const image_mod = b.addModule("image", .{
         .root_source_file = b.path("src/image.zig"),
@@ -186,6 +195,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "term", .module = term_mod },
             .{ .name = "cli", .module = cli_mod },
             .{ .name = "image", .module = image_mod },
+            .{ .name = "resample", .module = resample_mod },
         },
     });
 
@@ -246,6 +256,12 @@ pub fn build(b: *std.Build) void {
     });
     const run_depth_tests = b.addRunArtifact(depth_tests);
 
+    // Resample module tests
+    const resample_tests = b.addTest(.{
+        .root_module = resample_mod,
+    });
+    const run_resample_tests = b.addRunArtifact(resample_tests);
+
     // Terminal module tests
     const term_tests = b.addTest(.{
         .root_module = term_mod,
@@ -276,6 +292,7 @@ pub fn build(b: *std.Build) void {
     for (run_converter_submodule_tests) |run| test_step.dependOn(&run.step);
     test_step.dependOn(&run_image_tests.step);
     test_step.dependOn(&run_depth_tests.step);
+    test_step.dependOn(&run_resample_tests.step);
     test_step.dependOn(&run_term_tests.step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_cli_tests.step);

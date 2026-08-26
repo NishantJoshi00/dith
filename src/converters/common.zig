@@ -96,27 +96,28 @@ pub inline fn clampToU8(value: i32) u8 {
 // =============================================================================
 
 pub const Rgb = types.Rgb;
-pub const Palette = types.Palette;
 pub const Theme = types.Theme;
 
-/// Optional per-cell coloring layered over the dot pattern. All ranges run
-/// from the terminal's background to its foreground (or to the source's hue
-/// when color is on), so output follows the user's theme.
+/// Optional per-cell coloring layered over the dot pattern. Cells are painted
+/// only with the terminal's own colors: each cell picks the entry that best
+/// completes what its dots show, and the difference is carried into the
+/// neighbouring cells (error diffusion at cell resolution), so tones between
+/// entries appear as mixtures. Without color only the neutral entries are
+/// used; with color all of them.
 ///
-/// - brightness: dot intensity follows a tone curve of cell luma
-/// - color: dot hue follows the source chroma
-/// - depth: only the nearest part of the scene (from the camera's person
-///   mask) is dithered; the rest stays empty so the terminal shows through
+/// - brightness: cell tone follows a tone curve of cell luma
+/// - color: cell hue follows the source chroma
+/// - depth: cell tone follows nearness (from the depth map): near cells get
+///   full ink, far ones fade toward the background
 pub const Shading = struct {
     brightness: bool,
     color: bool,
-    /// How far into the scene to keep: 0 = only what the mask is surest is
-    /// nearest, 255 = everything
-    depth: ?u8,
-    palette: Palette,
+    depth: bool,
     theme: Theme,
-    /// Tone curve: cell luma -> mix amount toward the ink color
+    /// Tone curve: cell luma -> tone
     lut: [256]u8,
+    /// Nearness -> tone (a straight ramp)
+    depth_lut: [256]u8,
 
     /// Default curve exponent. The dither thresholds gamma-encoded luma, so a
     /// mid-gray region ends up ~50% dot coverage, which the eye reads as far
@@ -129,17 +130,18 @@ pub const Shading = struct {
     pub const none: Shading = .{
         .brightness = false,
         .color = false,
-        .depth = null,
-        .palette = .truecolor,
+        .depth = false,
         .theme = undefined,
         .lut = undefined,
+        .depth_lut = undefined,
     };
 
     pub const Options = struct {
         gamma: ?f32 = null,
         color: bool = false,
-        depth: ?u8 = null,
-        palette: Palette = .@"256",
+        /// Tone follows nearness: far cells sit near the background, near
+        /// cells near the foreground
+        depth: bool = false,
         theme: Theme,
     };
 
@@ -148,29 +150,34 @@ pub const Shading = struct {
             .brightness = options.gamma != null,
             .color = options.color,
             .depth = options.depth,
-            .palette = options.palette,
             .theme = options.theme,
             .lut = undefined,
+            .depth_lut = undefined,
         };
-        if (options.gamma) |gamma| {
-            const f: f32 = @floatFromInt(floor);
-            for (0..256) |i| {
-                const t = @as(f32, @floatFromInt(i)) / 255.0;
-                const v = f + (255.0 - f) * std.math.pow(f32, t, gamma);
-                s.lut[i] = @intFromFloat(@round(@min(255.0, @max(0.0, v))));
-            }
-        }
+        if (options.gamma) |gamma| fillCurve(&s.lut, gamma);
+        // Depth is a straight ramp: nearness 0 is the background, 255 the foreground
+        for (0..256) |i| s.depth_lut[i] = @intCast(i);
         return s;
     }
 
-    /// Whether cells need color at encode time (depth alone does not)
+    /// floor + (255 - floor) * x^exponent
+    fn fillCurve(lut: *[256]u8, exponent: f32) void {
+        const f: f32 = @floatFromInt(floor);
+        for (0..256) |i| {
+            const t = @as(f32, @floatFromInt(i)) / 255.0;
+            const v = f + (255.0 - f) * std.math.pow(f32, t, exponent);
+            lut[i] = @intFromFloat(@round(@min(255.0, @max(0.0, v))));
+        }
+    }
+
+    /// Whether cells need color at encode time
     pub inline fn enabled(self: Shading) bool {
-        return self.brightness or self.color;
+        return self.brightness or self.color or self.depth;
     }
 };
 
-/// Worst case bytes per shaded cell: truecolor fg escape (19) + glyph (3)
-const MAX_SHADED_CELL_BYTES = 22;
+/// Worst case bytes per shaded cell: "\x1b[22;107m" (9) + glyph (3)
+const MAX_SHADED_CELL_BYTES = 12;
 const RESET_SGR = "\x1b[0m";
 
 /// Half-open source-pixel span covered by one output cell along one axis
@@ -204,9 +211,9 @@ fn cellLuma(image: Image, xs: Span, ys: Span) u8 {
     return @intCast(sum / n);
 }
 
-/// The source's hue at full intensity over a cell footprint, or null when
-/// there is no chroma to draw from
-fn cellHue(image: Image, luma: u8, xs: Span, ys: Span) ?Rgb {
+/// The cell's actual color (mean luma and chroma over its footprint), or
+/// null when there is no chroma to draw from
+fn cellRgb(image: Image, luma: u8, xs: Span, ys: Span) ?Rgb {
     const chroma = image.chroma orelse return null;
 
     // Mean chroma over the footprint at 4:2:0 resolution
@@ -229,67 +236,287 @@ fn cellHue(image: Image, luma: u8, xs: Span, ys: Span) ?Rgb {
 
     // Full-range BT.601 Y'CbCr -> RGB, fixed point (16 fractional bits)
     const yi: i32 = luma;
-    const r: u32 = clampToU8(yi + ((91881 * cr) >> 16));
-    const g: u32 = clampToU8(yi - ((22554 * cb + 46802 * cr) >> 16));
-    const b: u32 = clampToU8(yi + ((116130 * cb) >> 16));
-
-    // Normalize so the brightest channel is full: hue and saturation only
-    const m = @max(r, @max(g, b));
-    if (m == 0) return null;
-    return .{ @intCast(r * 255 / m), @intCast(g * 255 / m), @intCast(b * 255 / m) };
+    return .{
+        clampToU8(yi + ((91881 * cr) >> 16)),
+        clampToU8(yi - ((22554 * cb + 46802 * cr) >> 16)),
+        clampToU8(yi + ((116130 * cb) >> 16)),
+    };
 }
 
-/// Linear blend from `a` toward `b` by t/255
-inline fn mix(a: Rgb, b: Rgb, t: u32) Rgb {
-    var out: Rgb = undefined;
-    for (0..3) |i| {
-        const ai: u32 = a[i];
-        const bi: u32 = b[i];
-        out[i] = @intCast((ai * (255 - t) + bi * t) / 255);
+/// Mean nearness (0 far .. 255 near) over a cell footprint
+fn cellNearness(image: Image, mask: types.Mask, xs: Span, ys: Span) u8 {
+    var sum: u32 = 0;
+    for (ys.start..ys.end) |y| {
+        for (xs.start..xs.end) |x| {
+            sum += mask.at(@intCast(x), @intCast(y), image.width, image.height);
+        }
     }
-    return out;
+    return @intCast(sum / ((ys.end - ys.start) * (xs.end - xs.start)));
 }
 
-/// Dot color for one cell
-fn cellShade(image: Image, xs: Span, ys: Span, invert: bool, shading: Shading) Rgb {
+/// What a cell asks of the palette: a hue (its color at full intensity) and
+/// a tone (how much ink it should carry, 0-255). The dots already carry
+/// luma, so the hue is brightness-free; tone comes from the brightness and
+/// depth curves and only picks the normal or bright variant of an entry.
+const CellLook = struct { hue: Rgb, level: u8 };
+
+fn cellLook(image: Image, xs: Span, ys: Span, invert: bool, shading: Shading) CellLook {
     const luma = cellLuma(image, xs, ys);
 
     // In inverted output the ink marks dark regions, so tone follows inverted
     // luma to keep dense ink bright
     const tone: u8 = if (invert) 255 - luma else luma;
-    const t: u32 = if (shading.brightness) shading.lut[tone] else 255;
+    var level: u32 = 255;
+    if (shading.brightness) level = shading.lut[tone];
+    if (shading.depth) {
+        if (image.mask) |mask| {
+            level = level * shading.depth_lut[cellNearness(image, mask, xs, ys)] / 255;
+        }
+    }
 
-    const ink: Rgb = if (shading.color) (cellHue(image, luma, xs, ys) orelse shading.theme.fg) else shading.theme.fg;
-    return mix(shading.theme.bg, ink, t);
+    var hue: Rgb = .{ 255, 255, 255 };
+    if (shading.color) {
+        if (cellRgb(image, luma, xs, ys)) |rgb| hue = normalizeHue(rgb);
+    }
+    return .{ .hue = hue, .level = @intCast(level) };
 }
 
-// ---- palette mapping ---------------------------------------------------------
+/// A color scaled so its brightest channel is full; neutral for black
+fn normalizeHue(rgb: Rgb) Rgb {
+    const max: u32 = @max(rgb[0], @max(rgb[1], rgb[2]));
+    if (max == 0) return .{ 255, 255, 255 };
+    return .{
+        @intCast(@as(u32, rgb[0]) * 255 / max),
+        @intCast(@as(u32, rgb[1]) * 255 / max),
+        @intCast(@as(u32, rgb[2]) * 255 / max),
+    };
+}
 
-/// A color as it will be sent to the terminal; equal values mean no new escape
-const Encoded = union(enum) {
+// ---- palette -------------------------------------------------------------------
+
+/// The theme foreground, as a candidate alongside the 16 palette entries
+const fg_index: u8 = 16;
+
+const Candidate = struct {
     rgb: Rgb,
+    /// Entry at full intensity, what hue matching compares against
+    hue: Rgb,
+    /// Close enough to the background to read as "nothing"; only a tone
+    /// target for fading out, never a hue
+    near_bg: bool,
+    /// Lies on the line from the background to the foreground: a genuine
+    /// shade of the foreground (the foreground itself always qualifies)
+    on_fg_line: bool,
     index: u8,
 };
 
-inline fn quantize(v: u8) u8 {
-    // 32 levels per channel: long runs of identical color mean far fewer
-    // escape sequences on the wire, invisible at dot scale
-    return (v & 0xF8) | 0x04;
+/// How far off the background-to-foreground line an entry may sit and still
+/// count as a shade of the foreground. Tight on purpose: a palette rarely
+/// contains true shades of its foreground, and anything that merely looks
+/// gray-ish (a tinted gray, a tan) breaks the ramp. Tones between the
+/// foreground and the background come from mixing the two across cells.
+const shade_tolerance: u32 = 6;
+
+/// Where `c` falls along the line from `from` to `to`, 0-255, and how far
+/// off that line it is
+fn projectOntoLine(c: Rgb, from: Rgb, to: Rgb) struct { t: u8, off: u32 } {
+    var num: i64 = 0;
+    var den: i64 = 0;
+    for (0..3) |i| {
+        const d: i64 = @as(i64, to[i]) - from[i];
+        num += (@as(i64, c[i]) - from[i]) * d;
+        den += d * d;
+    }
+    if (den == 0) return .{ .t = 0, .off = distanceSq(c, from) };
+    const t_scaled = @max(0, @min(255, @divTrunc(num * 255, den)));
+    var off: u32 = 0;
+    for (0..3) |i| {
+        const d: i64 = @as(i64, to[i]) - from[i];
+        const point: i64 = from[i] + @divTrunc(d * t_scaled, 255);
+        const diff: i64 = @as(i64, c[i]) - point;
+        off += @intCast(diff * diff);
+    }
+    return .{ .t = @intCast(t_scaled), .off = off };
 }
 
-const cube_levels = [6]u8{ 0, 95, 135, 175, 215, 255 };
+/// Every theme color a cell might be painted with (the 16 entries plus the
+/// foreground). Hue matching skips the ones indistinguishable from the
+/// background, and without color everything that is not a shade of the
+/// foreground; tone matching walks whatever shades exist.
+fn candidates(shading: Shading, out: *[17]Candidate) []Candidate {
+    var all: [17]struct { rgb: Rgb, index: u8 } = undefined;
+    for (shading.theme.colors, 0..) |c, i| all[i] = .{ .rgb = c, .index = @intCast(i) };
+    all[16] = .{ .rgb = shading.theme.fg, .index = fg_index };
+    for (all, 0..) |c, i| {
+        const on_line = projectOntoLine(c.rgb, shading.theme.bg, shading.theme.fg);
+        out[i] = .{
+            .rgb = c.rgb,
+            .hue = normalizeHue(c.rgb),
+            .near_bg = distanceSq(c.rgb, shading.theme.bg) < 24 * 24,
+            .on_fg_line = c.index == fg_index or on_line.off <= shade_tolerance * shade_tolerance,
+            .index = c.index,
+        };
+    }
+    return out[0..17];
+}
 
-inline fn nearestCubeLevel(v: u8) u8 {
-    var best: u8 = 0;
-    var best_d: u32 = 256;
-    for (cube_levels, 0..) |level, i| {
-        const d = absDiff(v, level);
-        if (d < best_d) {
-            best_d = d;
-            best = @intCast(i);
+inline fn hueEligible(c: Candidate, shading: Shading) bool {
+    if (c.near_bg) return false;
+    return shading.color or c.on_fg_line;
+}
+
+/// One rung of a tone ladder: a palette entry, possibly rendered dim
+const Rung = struct { index: u8, dim: bool, t: u8 };
+
+/// Where a color falls between the background and `top`, 0-255
+fn toneOf(c: Rgb, bg: Rgb, top: Rgb) u8 {
+    return projectOntoLine(c, bg, top).t;
+}
+
+/// Half way from the background to a color: what the terminal shows for
+/// that color rendered dim, near enough
+fn dimmed(c: Rgb, bg: Rgb) Rgb {
+    var out: Rgb = undefined;
+    for (0..3) |i| out[i] = @intCast((@as(u32, c[i]) + bg[i]) / 2);
+    return out;
+}
+
+/// The rungs available for the hue that won, from nothing to full:
+/// the entry nearest the background, then dim and normal (and bright, for
+/// colors) renderings of the hue's entries. Only the foreground and true
+/// shades of it serve the neutral ladder, so a fade never changes hue.
+fn toneLadder(list: []const Candidate, pick: Candidate, shading: Shading, out: *[12]Rung) []Rung {
+    const bg = shading.theme.bg;
+    var n: usize = 0;
+
+    // Bottom rung: whatever is closest to the background
+    var floor_index: ?u8 = null;
+    var floor_d: u32 = 24 * 24;
+    for (list) |c| {
+        const d = distanceSq(c.rgb, bg);
+        if (d < floor_d) {
+            floor_d = d;
+            floor_index = c.index;
         }
     }
-    return best;
+    if (floor_index) |idx| {
+        out[n] = .{ .index = idx, .dim = false, .t = 0 };
+        n += 1;
+    }
+
+    if (pick.on_fg_line) {
+        const fg = shading.theme.fg;
+        for (list) |c| {
+            if (!c.on_fg_line or c.index == fg_index or c.near_bg) continue;
+            if (n + 4 > out.len) break; // leave room for the foreground's two rungs
+            out[n] = .{ .index = c.index, .dim = true, .t = toneOf(dimmed(c.rgb, bg), bg, fg) };
+            n += 1;
+            out[n] = .{ .index = c.index, .dim = false, .t = toneOf(c.rgb, bg, fg) };
+            n += 1;
+        }
+        out[n] = .{ .index = fg_index, .dim = true, .t = 128 };
+        n += 1;
+        out[n] = .{ .index = fg_index, .dim = false, .t = 255 };
+        n += 1;
+        return out[0..n];
+    }
+
+    // A color: its normal and bright entries, measured against the brighter one
+    const sibling: u8 = if (pick.index >= 8) pick.index - 8 else pick.index + 8;
+    var family: [2]?Candidate = .{ pick, null };
+    for (list) |c| {
+        if (c.index == sibling) family[1] = c;
+    }
+    var top = pick.rgb;
+    if (family[1]) |sib| {
+        if (@max(sib.rgb[0], @max(sib.rgb[1], sib.rgb[2])) > @max(top[0], @max(top[1], top[2]))) top = sib.rgb;
+    }
+    for (family) |maybe| {
+        const c = maybe orelse continue;
+        out[n] = .{ .index = c.index, .dim = true, .t = toneOf(dimmed(c.rgb, bg), bg, top) };
+        n += 1;
+        out[n] = .{ .index = c.index, .dim = false, .t = toneOf(c.rgb, bg, top) };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// Threshold in [0, 1) for this cell: a fixed pseudo-random value per cell
+/// (and per use, via `phase`), so mixing has no visible lattice and a
+/// still cell never changes its mind between frames
+inline fn orderedThreshold(col: u32, row: u32, phase: u32) f32 {
+    var h: u32 = col *% 0x9E3779B1 ^ row *% 0x85EBCA77 ^ phase *% 0xC2B2AE3D;
+    h ^= h >> 15;
+    h *%= 0x2C1B3C6D;
+    h ^= h >> 12;
+    h *%= 0x297A2D39;
+    h ^= h >> 15;
+    return @as(f32, @floatFromInt(h >> 8)) / 16777216.0;
+}
+
+/// How far `want` sits from `a` toward `b`, 0-1, along the line between them
+fn mixFraction(want: [3]i32, a: Rgb, b: Rgb) f32 {
+    var num: i64 = 0;
+    var den: i64 = 0;
+    for (0..3) |i| {
+        const d: i64 = @as(i64, b[i]) - a[i];
+        num += (want[i] - a[i]) * d;
+        den += d * d;
+    }
+    if (den == 0) return 0;
+    return @max(0.0, @min(1.0, @as(f32, @floatFromInt(num)) / @as(f32, @floatFromInt(den))));
+}
+
+const NearestTwo = struct { first: Candidate, second: ?Candidate };
+
+/// The two hue-eligible entries nearest `want`; the foreground wins ties
+fn nearestTwo(list: []const Candidate, want: [3]i32, shading: Shading) NearestTwo {
+    var first: ?Candidate = null;
+    var first_d: i64 = std.math.maxInt(i64);
+    var second: ?Candidate = null;
+    var second_d: i64 = std.math.maxInt(i64);
+    // Foreground first so ties keep it
+    const fg = list[list.len - 1];
+    if (hueEligible(fg, shading)) {
+        first = fg;
+        first_d = weightedDistance(want, fg.hue);
+    }
+    for (list) |c| {
+        if (!hueEligible(c, shading) or c.index == fg_index) continue;
+        const d = weightedDistance(want, c.hue);
+        if (d < first_d) {
+            first = c;
+            first_d = d;
+        }
+    }
+    const winner = first orelse fg;
+    // Second: nearest entry of a genuinely different hue, else there is
+    // nothing to mix with
+    for (list) |c| {
+        if (!hueEligible(c, shading) or std.meta.eql(c.hue, winner.hue)) continue;
+        const d = weightedDistance(want, c.hue);
+        if (d < second_d) {
+            second = c;
+            second_d = d;
+        }
+    }
+    return .{ .first = winner, .second = second };
+}
+
+/// The rung for a tone: the two rungs around it, mixed by `threshold`
+fn rungForTone(ladder: []const Rung, level: u8, threshold: f32) Rung {
+    var lower: ?Rung = null;
+    var upper: ?Rung = null;
+    // Later rungs win ties: the ladder ends with the foreground's own rungs
+    for (ladder) |r| {
+        if (r.t <= level and (lower == null or r.t >= lower.?.t)) lower = r;
+        if (r.t >= level and (upper == null or r.t <= upper.?.t)) upper = r;
+    }
+    const lo = lower orelse return upper.?;
+    const hi = upper orelse return lo;
+    if (hi.t == lo.t) return hi;
+    const f = @as(f32, @floatFromInt(level - lo.t)) / @as(f32, @floatFromInt(hi.t - lo.t));
+    return if (threshold < f) hi else lo;
 }
 
 inline fn distanceSq(a: Rgb, b: Rgb) u32 {
@@ -301,68 +528,12 @@ inline fn distanceSq(a: Rgb, b: Rgb) u32 {
     return d;
 }
 
-/// Nearest entry of the xterm 256-color palette: the 6x6x6 cube or, for
-/// near-neutral colors, the finer 24-step gray ramp
-pub fn nearest256(rgb: Rgb) u8 {
-    const ri = nearestCubeLevel(rgb[0]);
-    const gi = nearestCubeLevel(rgb[1]);
-    const bi = nearestCubeLevel(rgb[2]);
-    const cube_index: u8 = 16 + 36 * ri + 6 * gi + bi;
-    const cube_rgb: Rgb = .{ cube_levels[ri], cube_levels[gi], cube_levels[bi] };
-
-    const avg: u32 = (@as(u32, rgb[0]) + rgb[1] + rgb[2]) / 3;
-    // Gray ramp: 232..255 are 8, 18, ..., 238
-    const step: u32 = if (avg < 8) 0 else @min(23, (avg - 8 + 5) / 10);
-    const gray: u8 = @intCast(8 + 10 * step);
-    const gray_rgb: Rgb = .{ gray, gray, gray };
-
-    return if (distanceSq(rgb, gray_rgb) < distanceSq(rgb, cube_rgb)) @intCast(232 + step) else cube_index;
-}
-
-/// Best of the terminal's 16 ANSI colors. Plain nearest-RGB would send every
-/// mid or dark tone to black, so hue is matched first (against the palette
-/// at full intensity) and intensity then picks the normal or bright variant.
-/// Near-neutral colors walk the gray ladder black -> dark gray -> light gray -> white.
-pub fn nearest16(colors: [16]Rgb, rgb: Rgb) u8 {
-    const max: u32 = @max(rgb[0], @max(rgb[1], rgb[2]));
-    const min: u32 = @min(rgb[0], @min(rgb[1], rgb[2]));
-
-    if (max - min < 40) {
-        // Neutral: 0 black, 8 dark gray, 7 light gray, 15 white
-        return if (max < 32) 0 else if (max < 110) 8 else if (max < 200) 7 else 15;
-    }
-    if (max < 24) return 0;
-
-    const target = normalizeHue(rgb, max);
-    var best: u8 = 1;
-    var best_d: u32 = std.math.maxInt(u32);
-    for (1..7) |i| {
-        const c = colors[i];
-        const cm: u32 = @max(c[0], @max(c[1], c[2]));
-        if (cm == 0) continue;
-        const d = distanceSq(target, normalizeHue(c, cm));
-        if (d < best_d) {
-            best_d = d;
-            best = @intCast(i);
-        }
-    }
-    return if (max > 160) best + 8 else best;
-}
-
-inline fn normalizeHue(rgb: Rgb, max: u32) Rgb {
-    return .{
-        @intCast(@as(u32, rgb[0]) * 255 / max),
-        @intCast(@as(u32, rgb[1]) * 255 / max),
-        @intCast(@as(u32, rgb[2]) * 255 / max),
-    };
-}
-
-fn encodeColor(shading: Shading, rgb: Rgb) Encoded {
-    return switch (shading.palette) {
-        .truecolor => .{ .rgb = .{ quantize(rgb[0]), quantize(rgb[1]), quantize(rgb[2]) } },
-        .@"256" => .{ .index = nearest256(rgb) },
-        .@"16" => .{ .index = nearest16(shading.theme.colors, rgb) },
-    };
+/// Perceptually weighted distance between a wanted hue and a candidate's
+inline fn weightedDistance(want: [3]i32, c: Rgb) i64 {
+    const dr: i64 = want[0] - c[0];
+    const dg: i64 = want[1] - c[1];
+    const db: i64 = want[2] - c[2];
+    return 2 * dr * dr + 4 * dg * dg + 3 * db * db;
 }
 
 inline fn appendDecimal(out: *std.ArrayList(u8), v: u8) void {
@@ -371,43 +542,29 @@ inline fn appendDecimal(out: *std.ArrayList(u8), v: u8) void {
     out.appendAssumeCapacity('0' + v % 10);
 }
 
-const Layer = enum { fg, bg };
-
-fn appendSgr(out: *std.ArrayList(u8), shading: Shading, layer: Layer, color: Encoded) void {
-    switch (color) {
-        .rgb => |rgb| {
-            out.appendSliceAssumeCapacity(if (layer == .fg) "\x1b[38;2;" else "\x1b[48;2;");
-            appendDecimal(out, rgb[0]);
-            out.appendAssumeCapacity(';');
-            appendDecimal(out, rgb[1]);
-            out.appendAssumeCapacity(';');
-            appendDecimal(out, rgb[2]);
-            out.appendAssumeCapacity('m');
-        },
-        .index => |idx| switch (shading.palette) {
-            .@"16" => {
-                // 30-37 / 90-97 for fg, 40-47 / 100-107 for bg
-                const base: u8 = if (idx < 8) (if (layer == .fg) 30 else 40) else (if (layer == .fg) 90 else 100);
-                out.appendSliceAssumeCapacity("\x1b[");
-                appendDecimal(out, base + (idx & 7));
-                out.appendAssumeCapacity('m');
-            },
-            else => {
-                out.appendSliceAssumeCapacity(if (layer == .fg) "\x1b[38;5;" else "\x1b[48;5;");
-                appendDecimal(out, idx);
-                out.appendAssumeCapacity('m');
-            },
-        },
+/// Foreground SGR for a rung: intensity (dim or normal) plus the entry
+/// (or the default foreground)
+fn appendForeground(out: *std.ArrayList(u8), rung: Rung) void {
+    out.appendSliceAssumeCapacity(if (rung.dim) "\x1b[2;" else "\x1b[22;");
+    if (rung.index == fg_index) {
+        appendDecimal(out, 39);
+    } else {
+        appendDecimal(out, if (rung.index < 8) 30 + rung.index else 90 + (rung.index - 8));
     }
+    out.appendAssumeCapacity('m');
 }
 
 // ---- incremental re-dithering --------------------------------------------------
 
-/// Pixels around a change that error diffusion must revisit
-pub const redo_margin: u32 = 3;
-/// A changed pixel needs this many changed neighbours (of 8) to count as
-/// real motion rather than a noise outlier
-pub const redo_support: u8 = 3;
+/// Pixels around a change that error diffusion must revisit. Kept smaller
+/// than a Braille cell: neighbours carry their stored error across, so one
+/// pixel of margin keeps the pattern continuous, and a patch this small
+/// reads as dither noise rather than a rectangle.
+pub const redo_margin: u32 = 1;
+/// A changed pixel needs this many changed neighbours (of 8) to be
+/// re-dithered. Zero: every change counts. Requiring agreement turns slow
+/// drift into blobs that update together, which shows as blotches.
+pub const redo_support: u8 = 0;
 
 /// Turn a raw change map into the set of pixels to re-dither: drop isolated
 /// changes (noise), then grow what is left by `redo_margin` in every
@@ -541,11 +698,14 @@ fn encodeShaded(
     const row_spans = try cellSpans(allocator, target_rows, 4, scale_y, image.height);
     defer allocator.free(row_spans);
 
+    var candidate_storage: [17]Candidate = undefined;
+    const palette = candidates(shading, &candidate_storage);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacityPrecise(allocator, target_rows * (target_cols * MAX_SHADED_CELL_BYTES + 1) + RESET_SGR.len);
 
-    var prev_fg: ?Encoded = null;
+    var prev_fg: ?Rung = null;
 
     var row: u32 = 0;
     while (row < target_rows) : (row += 1) {
@@ -555,10 +715,27 @@ fn encodeShaded(
 
             // Blank cells show no ink and need no color
             if (pattern != 0) {
-                const fg = encodeColor(shading, cellShade(image, col_spans[col], row_spans[row], invert, shading));
-                if (prev_fg == null or !std.meta.eql(fg, prev_fg.?)) {
-                    appendSgr(&out, shading, .fg, fg);
-                    prev_fg = fg;
+                const look = cellLook(image, col_spans[col], row_spans[row], invert, shading);
+
+                // Hue: the two nearest entries, mixed by an ordered pattern
+                // so tones between them appear as interleaved cells. Each
+                // cell depends only on itself, so a still scene never
+                // changes color.
+                const want = [3]i32{ look.hue[0], look.hue[1], look.hue[2] };
+                const pair = nearestTwo(palette, want, shading);
+                const pick = if (pair.second) |second| blk: {
+                    const f = mixFraction(want, pair.first.hue, second.hue);
+                    break :blk if (orderedThreshold(col, row, 0) < f) second else pair.first;
+                } else pair.first;
+
+                // Tone: the two rungs around the wanted tone, mixed the same way
+                var ladder_storage: [12]Rung = undefined;
+                const ladder = toneLadder(palette, pick, shading, &ladder_storage);
+                const rung = rungForTone(ladder, look.level, orderedThreshold(col, row, 1));
+
+                if (prev_fg == null or prev_fg.?.index != rung.index or prev_fg.?.dim != rung.dim) {
+                    appendForeground(&out, rung);
+                    prev_fg = rung;
                 }
             }
 
@@ -573,25 +750,6 @@ fn encodeShaded(
     return out.toOwnedSlice(allocator);
 }
 
-/// Subject mask gate for dots: present only when depth is on and the source
-/// carries a mask
-pub const MaskGate = struct {
-    mask: types.Mask,
-    cutoff: u8,
-
-    /// The gate for this image under this shading, if any. Depth counts
-    /// outward from the subject, so the confidence a dot needs is 255 - depth.
-    pub fn from(image: Image, shading: Shading) ?MaskGate {
-        const depth = shading.depth orelse return null;
-        const mask = image.mask orelse return null;
-        return .{ .mask = mask, .cutoff = 255 - depth };
-    }
-
-    pub inline fn allows(self: MaskGate, x: u32, y: u32, width: u32, height: u32) bool {
-        return self.mask.at(x, y, width, height) >= self.cutoff;
-    }
-};
-
 /// Samples a binary pixel buffer (stride == width) into Braille cells
 const BinarySampler = struct {
     binary: []const u8,
@@ -600,7 +758,6 @@ const BinarySampler = struct {
     scale_x: f32,
     scale_y: f32,
     invert: bool,
-    gate: ?MaskGate,
 
     inline fn pattern(self: BinarySampler, col: u32, row: u32) u8 {
         var bits: u8 = 0;
@@ -618,7 +775,6 @@ const BinarySampler = struct {
                 const idx = src_y * self.width + src_x;
                 var is_set = self.binary[idx] != 0;
                 if (self.invert) is_set = !is_set;
-                if (is_set and self.gate != null) is_set = self.gate.?.allows(src_x, src_y, self.width, self.height);
                 if (is_set) {
                     bits |= @as(u8, 1) << @intCast(i);
                 }
@@ -647,7 +803,6 @@ pub fn binaryToBraille(
         .scale_x = @as(f32, @floatFromInt(image.width)) / @as(f32, @floatFromInt(target_cols * 2)),
         .scale_y = @as(f32, @floatFromInt(image.height)) / @as(f32, @floatFromInt(target_rows * 4)),
         .invert = invert,
-        .gate = MaskGate.from(image, shading),
     };
     return encodeBraille(sampler, image, target_cols, target_rows, invert, shading, allocator);
 }
@@ -728,27 +883,37 @@ test "binaryToBraille without shading is the plain glyph grid" {
     try std.testing.expectEqual(@as(u8, '\n'), out[12]);
 }
 
-test "brightness shades between theme bg and fg, no background escape" {
+test "brightness paints only neutral theme entries and mixes across cells" {
     const allocator = std.testing.allocator;
-    const px = fullImage(8, 8, 128);
-    const image = Image{ .data = &px.data, .width = 8, .height = 8, .bytes_per_row = 8 };
-    const binary = [_]u8{255} ** 64;
+    // Left-to-right gradient, 16x8 pixels -> 8x2 cells
+    var px: [16 * 8]u8 = undefined;
+    for (0..8) |y| for (0..16) |x| {
+        px[y * 16 + x] = @intCast(x * 17);
+    };
+    const image = Image{ .data = &px, .width = 16, .height = 8, .bytes_per_row = 16 };
+    const binary = [_]u8{255} ** (16 * 8);
 
-    // Theme: dark blue background, warm foreground
-    var theme = test_theme;
-    theme.bg = .{ 0, 0, 40 };
-    theme.fg = .{ 255, 200, 0 };
-    const shading = Shading.init(.{ .gamma = 1.0, .palette = .truecolor, .theme = theme });
-    const out = try binaryToBraille(&binary, image, 4, 2, false, shading, allocator);
+    const shading = Shading.init(.{ .gamma = 1.0, .theme = test_theme });
+    const out = try binaryToBraille(&binary, image, 8, 2, false, shading, allocator);
     defer allocator.free(out);
 
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "\x1b[48;"));
     try std.testing.expect(std.mem.endsWith(u8, out, RESET_SGR));
-    // gamma 1.0 at luma 128: t = 24 + 231 * 128/255 = 140
-    // mix(bg, fg, 140): r = 255*140/255 = 140 -> 140, g = 200*140/255 = 109 -> 108, b = 40*115/255 = 18 -> 20
-    // uniform image, so exactly one foreground escape for the whole frame
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\x1b[38;2;"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[38;2;140;108;20m") != null);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "\x1b[38;"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "\x1b[48;"));
+    // Only the foreground (dim or normal), true shades of it, and the
+    // background-black rung: never a colored entry
+    var it = std.mem.splitSequence(u8, out, "\x1b[");
+    _ = it.next();
+    while (it.next()) |chunk| {
+        const m = std.mem.indexOfScalar(u8, chunk, 'm') orelse continue;
+        const code = chunk[0..m];
+        const ok = std.mem.eql(u8, code, "0") or std.mem.endsWith(u8, code, ";39") or std.mem.endsWith(u8, code, ";30") or std.mem.endsWith(u8, code, ";37") or std.mem.endsWith(u8, code, ";90") or std.mem.endsWith(u8, code, ";97");
+        try std.testing.expect(ok);
+    }
+    // The gradient walks the ladder: normal-intensity rungs at the bright end,
+    // dim or black rungs at the dark end
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;3") != null or std.mem.indexOf(u8, out, "\x1b[22;9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[2;") != null or std.mem.indexOf(u8, out, ";30m") != null);
 }
 
 test "shaded blank cells emit no color" {
@@ -760,84 +925,77 @@ test "shaded blank cells emit no color" {
     const out = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .gamma = 0.55, .color = true, .theme = test_theme }), allocator);
     defer allocator.free(out);
 
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "\x1b[38;"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\x1b["));
+    try std.testing.expect(std.mem.endsWith(u8, out, RESET_SGR));
 }
 
-test "color channel follows chroma" {
-    const allocator = std.testing.allocator;
-    const px = fullImage(8, 8, 128);
-    // Cb = 128 (neutral), Cr = 255 (strong red)
-    var chroma_px: [4 * 4 * 2]u8 = undefined;
-    for (0..16) |i| {
-        chroma_px[i * 2] = 128;
-        chroma_px[i * 2 + 1] = 255;
+fn redChromaImage(comptime w: u32, comptime h: u32, luma: u8, storage: *[w * h]u8, chroma: *[(w / 2) * (h / 2) * 2]u8) Image {
+    @memset(storage, luma);
+    for (0..(w / 2) * (h / 2)) |i| {
+        chroma[i * 2] = 90; // Cb low
+        chroma[i * 2 + 1] = 240; // Cr high: red
     }
-    const image = Image{
-        .data = &px.data,
-        .width = 8,
-        .height = 8,
-        .bytes_per_row = 8,
-        .chroma = .{ .data = &chroma_px, .width = 4, .height = 4, .bytes_per_row = 8 },
+    return .{
+        .data = storage,
+        .width = w,
+        .height = h,
+        .bytes_per_row = w,
+        .chroma = .{ .data = chroma, .width = w / 2, .height = h / 2, .bytes_per_row = w },
     };
-    const binary = [_]u8{255} ** 64;
-
-    const out = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .color = true, .palette = .truecolor, .theme = test_theme }), allocator);
-    defer allocator.free(out);
-
-    // Y=128, Cr=+127 -> R clamps to 255, G = 128 - 90 = 38, B = 128; at full
-    // intensity and quantized: (252, 36, 132)
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[38;2;252;36;132m") != null);
 }
 
-test "color without chroma falls back to theme fg" {
+test "color paints a red scene with the theme's reds only" {
+    const allocator = std.testing.allocator;
+    var px: [16 * 8]u8 = undefined;
+    var ch: [8 * 4 * 2]u8 = undefined;
+    const image = redChromaImage(16, 8, 120, &px, &ch);
+    const binary = [_]u8{255} ** (16 * 8);
+
+    const out = try binaryToBraille(&binary, image, 8, 2, false, Shading.init(.{ .color = true, .theme = test_theme }), allocator);
+    defer allocator.free(out);
+
+    const reds = std.mem.count(u8, out, ";31m") + std.mem.count(u8, out, ";91m");
+    try std.testing.expect(reds >= 1);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, ";32m") + std.mem.count(u8, out, ";34m") + std.mem.count(u8, out, ";92m") + std.mem.count(u8, out, ";94m"));
+}
+
+test "color mixes neighbouring cells to reach a tone between entries" {
+    const allocator = std.testing.allocator;
+    // Orange: between the theme's red (205,0,0) and yellow (205,205,0)
+    var px: [32 * 8]u8 = undefined;
+    var ch: [16 * 4 * 2]u8 = undefined;
+    // Y'CbCr for roughly (230,120,0): luma ~143, Cb ~47, Cr ~190
+    @memset(&px, 143);
+    for (0..16 * 4) |i| {
+        ch[i * 2] = 47;
+        ch[i * 2 + 1] = 190;
+    }
+    const image = Image{ .data = &px, .width = 32, .height = 8, .bytes_per_row = 32, .chroma = .{ .data = &ch, .width = 16, .height = 4, .bytes_per_row = 32 } };
+    const binary = [_]u8{255} ** (32 * 8);
+
+    const out = try binaryToBraille(&binary, image, 16, 2, false, Shading.init(.{ .color = true, .theme = test_theme }), allocator);
+    defer allocator.free(out);
+
+    const reds = std.mem.count(u8, out, ";31m") + std.mem.count(u8, out, ";91m");
+    const yellows = std.mem.count(u8, out, ";33m") + std.mem.count(u8, out, ";93m");
+    try std.testing.expect(reds >= 1);
+    try std.testing.expect(yellows >= 1);
+}
+
+test "color without chroma falls back to neutral entries" {
     const allocator = std.testing.allocator;
     const px = fullImage(8, 8, 255);
     const image = Image{ .data = &px.data, .width = 8, .height = 8, .bytes_per_row = 8 };
     const binary = [_]u8{255} ** 64;
 
-    const out = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .color = true, .palette = .truecolor, .theme = test_theme }), allocator);
+    const out = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .color = true, .theme = test_theme }), allocator);
     defer allocator.free(out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[38;2;252;252;252m") != null);
+    // White at full tone: the foreground itself
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[22;39m") != null);
 }
 
-test "256 palette maps grays to the ramp and colors to the cube" {
-    try std.testing.expectEqual(@as(u8, 16), nearest256(.{ 0, 0, 0 }));
-    try std.testing.expectEqual(@as(u8, 231), nearest256(.{ 255, 255, 255 }));
-    // Mid gray 128: ramp step 12 -> 128 exactly (index 244)
-    try std.testing.expectEqual(@as(u8, 244), nearest256(.{ 128, 128, 128 }));
-    // Pure red: cube (5,0,0) = 16 + 180 = 196
-    try std.testing.expectEqual(@as(u8, 196), nearest256(.{ 255, 0, 0 }));
-}
-
-test "16 palette keeps hue at low intensity and grays on the ladder" {
-    try std.testing.expectEqual(@as(u8, 9), nearest16(test_theme.colors, .{ 250, 10, 10 })); // bright red
-    try std.testing.expectEqual(@as(u8, 1), nearest16(test_theme.colors, .{ 87, 12, 12 })); // dark red stays red
-    try std.testing.expectEqual(@as(u8, 4), nearest16(test_theme.colors, .{ 10, 10, 120 })); // blue
-    try std.testing.expectEqual(@as(u8, 11), nearest16(test_theme.colors, .{ 240, 230, 20 })); // bright yellow
-    try std.testing.expectEqual(@as(u8, 0), nearest16(test_theme.colors, .{ 5, 5, 5 }));
-    try std.testing.expectEqual(@as(u8, 8), nearest16(test_theme.colors, .{ 80, 80, 80 }));
-    try std.testing.expectEqual(@as(u8, 7), nearest16(test_theme.colors, .{ 150, 150, 150 }));
-    try std.testing.expectEqual(@as(u8, 15), nearest16(test_theme.colors, .{ 250, 250, 250 }));
-}
-
-test "palette modes emit 256 and 16 color escapes" {
-    const allocator = std.testing.allocator;
-    const px = fullImage(8, 8, 255);
-    const image = Image{ .data = &px.data, .width = 8, .height = 8, .bytes_per_row = 8 };
-    const binary = [_]u8{255} ** 64;
-
-    const out256 = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .gamma = 1.0, .palette = .@"256", .theme = test_theme }), allocator);
-    defer allocator.free(out256);
-    try std.testing.expect(std.mem.indexOf(u8, out256, "\x1b[38;5;231m") != null);
-
-    const out16 = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .gamma = 1.0, .palette = .@"16", .theme = test_theme }), allocator);
-    defer allocator.free(out16);
-    // White -> bright white (index 15) -> SGR 97
-    try std.testing.expect(std.mem.indexOf(u8, out16, "\x1b[97m") != null);
-}
-
-test "dilateChanged drops lone changes and grows real ones by the margin" {
+test "dilateChanged grows changes by the margin" {
     const allocator = std.testing.allocator;
     var changed = [_]u8{0} ** (32 * 32);
     // A lone pixel: noise
@@ -850,68 +1008,39 @@ test "dilateChanged drops lone changes and grows real ones by the margin" {
     const out = try dilateChanged(map, 32, 32, allocator);
     defer allocator.free(out);
 
-    try std.testing.expectEqual(@as(u8, 0), out[3 * 32 + 3]);
+    // The lone pixel counts too (no support required) and grows by the margin
+    try std.testing.expectEqual(@as(u8, 1), out[3 * 32 + 3]);
     var count: usize = 0;
     for (out) |v| count += v;
     const side = 3 + redo_margin * 2;
-    try std.testing.expectEqual(@as(usize, side * side), count);
+    const lone = 1 + redo_margin * 2;
+    try std.testing.expectEqual(@as(usize, side * side + lone * lone), count);
     try std.testing.expectEqual(@as(u8, 1), out[(16 - redo_margin) * 32 + (16 - redo_margin)]);
     try std.testing.expectEqual(@as(u8, 0), out[(16 - redo_margin - 1) * 32 + 17]);
 }
 
-test "depth alone paints nothing: plain glyphs, no escapes" {
+test "depth fades far cells toward the background, near cells keep full ink" {
     const allocator = std.testing.allocator;
-    const px = fullImage(8, 8, 128);
-    const image = Image{ .data = &px.data, .width = 8, .height = 8, .bytes_per_row = 8 };
-    const binary = [_]u8{0} ** 64;
-
-    const shading = Shading.init(.{ .depth = 128, .theme = test_theme });
-    try std.testing.expect(!shading.enabled());
-    const out = try binaryToBraille(&binary, image, 4, 2, false, shading, allocator);
-    defer allocator.free(out);
-
-    try std.testing.expectEqual(@as(usize, 26), out.len);
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, out, "\x1b["));
-}
-
-test "depth keeps dots only where the subject mask is confident" {
-    const allocator = std.testing.allocator;
-    const px = fullImage(8, 8, 128);
-    // 2x2 mask: left half subject, right half background
-    const mask_px = [_]u8{ 255, 0, 255, 0 };
+    const px = fullImage(16, 8, 200);
+    // Left half near, right half far
+    const mask_px = [_]u8{ 255, 255, 0, 0 };
     const image = Image{
         .data = &px.data,
-        .width = 8,
+        .width = 16,
         .height = 8,
-        .bytes_per_row = 8,
-        .mask = .{ .data = &mask_px, .width = 2, .height = 2, .bytes_per_row = 2 },
+        .bytes_per_row = 16,
+        .mask = .{ .data = &mask_px, .width = 4, .height = 1, .bytes_per_row = 4 },
     };
-    const binary = [_]u8{255} ** 64;
+    const binary = [_]u8{255} ** (16 * 8);
 
-    const out = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .depth = 100, .theme = test_theme }), allocator);
+    const out = try binaryToBraille(&binary, image, 8, 2, false, Shading.init(.{ .depth = true, .theme = test_theme }), allocator);
     defer allocator.free(out);
 
-    const full = [_]u8{ 0xE2, 0xA3, 0xBF };
-    const blank = [_]u8{ 0xE2, 0xA0, 0x80 };
-    for (0..2) |row| {
-        for (0..4) |col| {
-            const offset = row * 13 + col * 3;
-            const expected = if (col < 2) &full else &blank;
-            try std.testing.expectEqualSlices(u8, expected, out[offset .. offset + 3]);
-        }
-    }
-
-    // Without depth the mask is ignored
-    const all = try binaryToBraille(&binary, image, 4, 2, false, .none, allocator);
-    defer allocator.free(all);
-    try std.testing.expectEqualSlices(u8, &full, all[9..12]);
-
-    // Depth 255 reaches everything, depth 0 only where the mask is certain
-    const everything = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .depth = 255, .theme = test_theme }), allocator);
-    defer allocator.free(everything);
-    try std.testing.expectEqualSlices(u8, &full, everything[9..12]);
-    const nearest = try binaryToBraille(&binary, image, 4, 2, false, Shading.init(.{ .depth = 0, .theme = test_theme }), allocator);
-    defer allocator.free(nearest);
-    try std.testing.expectEqualSlices(u8, &full, nearest[0..3]);
-    try std.testing.expectEqualSlices(u8, &blank, nearest[9..12]);
+    // Every dot still drawn
+    try std.testing.expectEqual(@as(usize, 16), std.mem.count(u8, out, &[_]u8{ 0xE2, 0xA3, 0xBF }));
+    // Near cells: the foreground itself; far cells: the entry closest to the
+    // background (black, index 0)
+    const first_row = out[0..std.mem.indexOfScalar(u8, out, '\n').?];
+    try std.testing.expect(std.mem.startsWith(u8, first_row, "\x1b[22;39m"));
+    try std.testing.expect(std.mem.indexOf(u8, first_row, "\x1b[22;30m") != null);
 }
